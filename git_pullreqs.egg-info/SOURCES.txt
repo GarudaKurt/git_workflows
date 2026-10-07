@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+git_pullreqs.egg-info/PKG-INFO
+git_pullreqs.egg-info/SOURCES.txt
+git_pullreqs.egg-info/dependency_links.txt
+git_pullreqs.egg-info/entry_points.txt
+git_pullreqs.egg-info/requires.txt
+git_pullreqs.egg-info/top_level.txt
+pullreqs/__init__.py
+pullreqs/cli.py
+pullreqs/config.py
+pullreqs/errors.py
+pullreqs/idstore.py
+pullreqs/parser.py
+pullreqs/provider.py
+tests/test_idstore.py
+tests/test_parser.py

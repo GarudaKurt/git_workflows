@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: git-pullreqs
+Version: 0.1.0
+Summary: git pullreqs: adds stable custom PR IDs (1010+) on top of the native PR IDs
+Requires-Python: >=3.9
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
