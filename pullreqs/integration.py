@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 
-STAGING_BRANCH = "dev/integrations"
+STAGING_BRANCH = "dev-integrations"
 BASE_BRANCH = "origin/dev"
 REMOTE = "origin"
 
