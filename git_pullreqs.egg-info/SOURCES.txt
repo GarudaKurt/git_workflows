@@ -11,9 +11,12 @@ pullreqs/cli.py
 pullreqs/config.py
 pullreqs/drop.py
 pullreqs/errors.py
+pullreqs/ids.py
 pullreqs/idstore.py
 pullreqs/integration.py
 pullreqs/parser.py
 pullreqs/provider.py
+pullreqs/push_master.py
+pullreqs/staging.py
 tests/test_idstore.py
 tests/test_parser.py

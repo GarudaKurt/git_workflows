@@ -1,3 +1,4 @@
 [console_scripts]
 git-drop = pullreqs.drop:main
 git-pullreqs = pullreqs.cli:main
+git-push-master = pullreqs.push_master:main

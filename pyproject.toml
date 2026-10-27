@@ -15,6 +15,7 @@ dev = ["pytest"]
 [project.scripts]
 git-pullreqs = "pullreqs.cli:main"
 git-drop = "pullreqs.drop:main"
+git-push-master = "pullreqs.push_master:main"
 
 [tool.setuptools]
 packages = ["pullreqs"]
