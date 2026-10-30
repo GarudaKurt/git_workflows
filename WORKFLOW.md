@@ -47,8 +47,18 @@ Branch names can be changed: `git config pullreqs.developmentBranch dev`,
 ### git push-master -m "message"
 * Promotes what is on **origin/integrations**. Refuses if your local branch differs from it (unpushed picks, or a drop not yet pushed), so what is promoted is what you validated.
 * Refuses commits on integrations that did not come through `git pullreqs -p` (`--allow-extra` overrides).
-* Opens a pull request integrations -> main and merges it with a **merge commit**, using your message. All original commits stay in history, and GitHub marks the picked PRs as merged. Dropped PRs are not promoted.
+* Opens a pull request integrations -> main and merges it with a **merge commit**, using your message. All original commits stay in history.  Dropped PRs are not promoted.
+* Afterwards it opens and merges a second PR **main -> development**, so development has the promotion commit and GitHub marks the picked PRs as merged. If that step fails the promotion still stands and it tells you what to do. `--no-sync-dev` skips it.
+* Any picked PR that GitHub still shows as open after that is closed with a comment (they target `development`, so GitHub does not always mark them merged). `--no-close` leaves them open.
 * If `main` needs approvals or checks, the PR stays open (exit code 2); merge it on GitHub. `--no-merge` opens it only, `--dry-run` shows the plan.
+
+### git pullreqs --create [-t TITLE] [--draft]
+* Run it on your feature branch: pushes the branch and opens a PR **against development** (title and description from your commits, or `-t`). Prints the PR number QA will use with `-p`.
+* Refuses on `development`, `integrations` or `main`, when there is nothing new to propose, or when the branch's open PR targets another branch. If a PR is already open it just shows it. Extra `gh pr create` options go after `--`, e.g. `-- --label qa`.
+
+### git pullreqs --report [-o FILE]
+* Writes one self-contained HTML dashboard (default `pullreqs-report.html`): PR counts, each PR's author, branch, latest commit id and message, its stage (ready, picked, in integrations, promoted, wrong target, merged, closed), and the numbered **Drops** list (what `git drop` shows) with a `git drop -N` simulator.
+* Needs `gh` logged in. Open the file in a browser; on WSL the Windows path is printed.
 
 ## Good to know
 * A conflict while picking stops with the PR named. Fix and `git commit --no-edit`, or `git merge --abort`.

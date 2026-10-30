@@ -23,8 +23,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--sync", action="store_true",
                    help="assign custom IDs to existing PRs that have none (oldest native id first)")
     g.add_argument("--create", action="store_true",
-                   help="create a PR via pullreqs.createCommand, then assign the next custom ID "
-                        "(extra args after `--` are passed to the create command)")
+                   help="push the current branch and open a PR against development "
+                        "(extra args after `--` go to `gh pr create`)")
+    g.add_argument("--report", action="store_true",
+                   help="write an HTML dashboard: PR counts, authors, latest commits and the drop list")
+    p.add_argument("-o", "--output", default="pullreqs-report.html", metavar="FILE",
+                   help="with --report: the file to write (default: pullreqs-report.html)")
+    p.add_argument("-t", "--title", metavar="TITLE", help="with --create: the PR title (default: from your commits)")
+    p.add_argument("--draft", action="store_true", help="with --create: open the PR as a draft")
     return p
 
 
@@ -86,6 +92,18 @@ def cmd_pick(tokens: List[str]):
     print("  git drop -N                      drop the first N of that list")
 
 
+def cmd_report(output: str):
+    from .report import windows_path, write_report
+    from .staging import fetch
+    if not fetch():
+        print("warning: could not reach the remote; using the last fetched state.", file=sys.stderr)
+    path = write_report(output)
+    print("Report written: {}".format(path))
+    win = windows_path(path)
+    if win:
+        print("Open it in Windows: {}".format(win))
+
+
 def cmd_sync(provider, store):
     ids = store.load(refresh=True)
     missing = sorted({p.native_id for p in provider.list()} - ids.keys(), key=int)
@@ -96,10 +114,9 @@ def cmd_sync(provider, store):
         print(f"{custom}  <-  {native}")
 
 
-def cmd_create(provider, store, extra):
-    native = provider.create(extra)
-    custom = store.allocate([native])[native]
-    print(f"Created PR: native {native}, custom {custom}")
+def cmd_create(args, extra):
+    from .create import create_pr
+    return create_pr(args.title, args.draft, extra)
 
 
 def main(argv=None) -> int:
@@ -112,6 +129,11 @@ def main(argv=None) -> int:
         if args.pick is not None:
             cmd_pick(args.pick)
             return 0
+        if args.report:
+            cmd_report(args.output)
+            return 0
+        if args.create:
+            return cmd_create(args, extra)
         cfg = load_config()
         provider = ShellProvider(cfg)
         store = IdStore(cfg.remote, cfg.ref, cfg.first_id)
@@ -119,8 +141,6 @@ def main(argv=None) -> int:
             cmd_oneline(provider, store)
         elif args.sync:
             cmd_sync(provider, store)
-        else:
-            cmd_create(provider, store, extra)
         return 0
     except (PullreqsError, StagingError) as e:
         print(f"git pullreqs: {e}", file=sys.stderr)

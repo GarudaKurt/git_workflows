@@ -16,9 +16,13 @@ the rule "Changes must be made through a pull request") reject direct pushes.  S
   2. it opens a pull request  integrations -> main  (or reuses the open one)
   3. it merges it with a merge commit, using your message as the commit subject
 
-A merge commit (not squash) keeps every original commit in main's history, so
-GitHub marks the picked pull requests as merged on its own.  PRs removed with
-`git drop` are not on the branch, so they are not promoted.
+A merge commit (not squash) keeps every original commit in main's history.  PRs
+removed with `git drop` are not on the branch, so they are not promoted.
+
+Afterwards it opens and merges a second PR  main -> development  so development
+has the promotion commit and GitHub marks the picked PRs as merged (skip it with
+--no-sync-dev).  Any picked PR that is still open after that is closed with a comment
+(--no-close to leave them).  If these steps fail the promotion still stands.
 """
 import argparse
 import json
@@ -27,7 +31,7 @@ import shutil
 import subprocess
 import sys
 
-from .staging import (StagingError, fetch, git, integrated_merges, integrated_prs, integrations_branch,
+from .staging import (StagingError, development_branch, fetch, git, integrated_merges, integrated_prs, integrations_branch,
                       local_branch_exists, pr_title, remote_name, remote_ref, rev, target_branch,
                       target_ref)
 
@@ -153,8 +157,70 @@ def run(args) -> int:
     print("\nDone. {} PR(s) are now in {}.".format(len(pending), target))
     if left:
         print("Still pending: " + ", ".join("#{}".format(n) for n, _ in left), file=sys.stderr)
+    if not args.no_sync_dev:
+        sync_development(target)
+    if not args.no_close:
+        close_promoted([n for n, _ in pending], number, target)
     print("Update your local {}:  git switch {} && git pull --ff-only".format(target, target))
     return 0
+
+
+def close_promoted(numbers, promotion_pr: int, target: str) -> None:
+    """Close picked PRs that GitHub still shows as open (their base is development, not main).
+
+    Uses --json / REST only: `gh pr view|close|edit` without --json can fail with the
+    "Projects (classic) is being deprecated" error. Never fails the promotion."""
+    for n in numbers:
+        r = gh("pr", "view", str(n), "--json", "state")
+        try:
+            state = json.loads(r.stdout)["state"] if r.returncode == 0 else None
+        except (ValueError, KeyError):
+            state = None
+        if state != "OPEN":
+            continue
+        gh("api", "-X", "POST", "repos/{owner}/{repo}/issues/%d/comments" % n, "-f",
+           "body=Promoted to `%s` through pull request #%d, together with the other picked PRs." % (target, promotion_pr))
+        r = gh("api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/%d" % n, "-f", "state=closed")
+        if r.returncode == 0:
+            print("Closed PR #{} (promoted to {}).".format(n, target))
+        else:
+            print("Could not close PR #{}: {}".format(n, (r.stderr or r.stdout).strip()), file=sys.stderr)
+
+
+def sync_development(target: str) -> None:
+    """Merge main back into development through a PR, so development has the promotion merge commit.
+
+    Never fails the promotion: if anything goes wrong it says what to do by hand."""
+    dev = development_branch()
+    title = "Sync {} into {}".format(target, dev)
+    pr = find_open_pr(target, dev)
+    if pr:
+        number, url = pr["number"], pr["url"]
+        print("\nReusing open sync pull request #{}: {}".format(number, url))
+    else:
+        r = gh("pr", "create", "--base", dev, "--head", target, "--title", title,
+               "--body", "Brings `{}` back into `{}` after a promotion, so the picked PRs show as merged.".format(target, dev))
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout).strip()
+            if "no commits between" in msg.lower():
+                print("\n{} already contains {}: nothing to sync.".format(dev, target))
+            else:
+                print("\nCould not open the sync PR {} -> {}:\n  {}\nDo it on GitHub when you can."
+                      .format(target, dev, msg), file=sys.stderr)
+            return
+        url = r.stdout.strip().splitlines()[-1]
+        m = re.search(r"/pull/(\d+)", url)
+        if not m:
+            print("\nSync PR created: " + url, file=sys.stderr)
+            return
+        number = int(m.group(1))
+        print("\nCreated sync pull request #{} ({} -> {}): {}".format(number, target, dev, url))
+    r = gh("pr", "merge", str(number), "--merge", "--subject", title)
+    if r.returncode != 0:
+        print("The sync PR was NOT merged (conflicts, approvals or checks):\n  {}\nMerge it at {}"
+              .format((r.stderr or r.stdout).strip(), url), file=sys.stderr)
+        return
+    print("{} is now merged back into {}; the picked PRs are no longer ahead of it.".format(target, dev))
 
 
 def main(argv=None) -> int:
@@ -163,6 +229,10 @@ def main(argv=None) -> int:
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would be promoted, change nothing")
     p.add_argument("--no-merge", action="store_true", help="open the pull request but do not merge it")
+    p.add_argument("--no-sync-dev", action="store_true",
+                   help="do not merge main back into development afterwards")
+    p.add_argument("--no-close", action="store_true",
+                   help="do not close picked PRs that GitHub still shows as open")
     p.add_argument("--allow-extra", action="store_true",
                    help="promote even if integrations has commits that are not picked PRs")
     args = p.parse_args(argv)

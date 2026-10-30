@@ -5,6 +5,8 @@
 #   git drop                     numbered list of the trial integration
 #   git drop -N                  drop the first N PRs of that list
 #   git push-master -m "msg"     promote integrations to main
+#   git pullreqs --create        push your branch, open a PR against development
+#   git pullreqs --report        HTML dashboard of PRs, authors, commits and drops
 # Run it INSIDE ~/git-pullreqs:   sh install-qa-workflow.sh      (safe to run twice)
 set -e
 if [ ! -f pyproject.toml ] || [ ! -d pullreqs ]; then
@@ -418,9 +420,13 @@ the rule "Changes must be made through a pull request") reject direct pushes.  S
   2. it opens a pull request  integrations -> main  (or reuses the open one)
   3. it merges it with a merge commit, using your message as the commit subject
 
-A merge commit (not squash) keeps every original commit in main's history, so
-GitHub marks the picked pull requests as merged on its own.  PRs removed with
-`git drop` are not on the branch, so they are not promoted.
+A merge commit (not squash) keeps every original commit in main's history.  PRs
+removed with `git drop` are not on the branch, so they are not promoted.
+
+Afterwards it opens and merges a second PR  main -> development  so development
+has the promotion commit and GitHub marks the picked PRs as merged (skip it with
+--no-sync-dev).  Any picked PR that is still open after that is closed with a comment
+(--no-close to leave them).  If these steps fail the promotion still stands.
 """
 import argparse
 import json
@@ -429,7 +435,7 @@ import shutil
 import subprocess
 import sys
 
-from .staging import (StagingError, fetch, git, integrated_merges, integrated_prs, integrations_branch,
+from .staging import (StagingError, development_branch, fetch, git, integrated_merges, integrated_prs, integrations_branch,
                       local_branch_exists, pr_title, remote_name, remote_ref, rev, target_branch,
                       target_ref)
 
@@ -555,8 +561,70 @@ def run(args) -> int:
     print("\nDone. {} PR(s) are now in {}.".format(len(pending), target))
     if left:
         print("Still pending: " + ", ".join("#{}".format(n) for n, _ in left), file=sys.stderr)
+    if not args.no_sync_dev:
+        sync_development(target)
+    if not args.no_close:
+        close_promoted([n for n, _ in pending], number, target)
     print("Update your local {}:  git switch {} && git pull --ff-only".format(target, target))
     return 0
+
+
+def close_promoted(numbers, promotion_pr: int, target: str) -> None:
+    """Close picked PRs that GitHub still shows as open (their base is development, not main).
+
+    Uses --json / REST only: `gh pr view|close|edit` without --json can fail with the
+    "Projects (classic) is being deprecated" error. Never fails the promotion."""
+    for n in numbers:
+        r = gh("pr", "view", str(n), "--json", "state")
+        try:
+            state = json.loads(r.stdout)["state"] if r.returncode == 0 else None
+        except (ValueError, KeyError):
+            state = None
+        if state != "OPEN":
+            continue
+        gh("api", "-X", "POST", "repos/{owner}/{repo}/issues/%d/comments" % n, "-f",
+           "body=Promoted to `%s` through pull request #%d, together with the other picked PRs." % (target, promotion_pr))
+        r = gh("api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/%d" % n, "-f", "state=closed")
+        if r.returncode == 0:
+            print("Closed PR #{} (promoted to {}).".format(n, target))
+        else:
+            print("Could not close PR #{}: {}".format(n, (r.stderr or r.stdout).strip()), file=sys.stderr)
+
+
+def sync_development(target: str) -> None:
+    """Merge main back into development through a PR, so development has the promotion merge commit.
+
+    Never fails the promotion: if anything goes wrong it says what to do by hand."""
+    dev = development_branch()
+    title = "Sync {} into {}".format(target, dev)
+    pr = find_open_pr(target, dev)
+    if pr:
+        number, url = pr["number"], pr["url"]
+        print("\nReusing open sync pull request #{}: {}".format(number, url))
+    else:
+        r = gh("pr", "create", "--base", dev, "--head", target, "--title", title,
+               "--body", "Brings `{}` back into `{}` after a promotion, so the picked PRs show as merged.".format(target, dev))
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout).strip()
+            if "no commits between" in msg.lower():
+                print("\n{} already contains {}: nothing to sync.".format(dev, target))
+            else:
+                print("\nCould not open the sync PR {} -> {}:\n  {}\nDo it on GitHub when you can."
+                      .format(target, dev, msg), file=sys.stderr)
+            return
+        url = r.stdout.strip().splitlines()[-1]
+        m = re.search(r"/pull/(\d+)", url)
+        if not m:
+            print("\nSync PR created: " + url, file=sys.stderr)
+            return
+        number = int(m.group(1))
+        print("\nCreated sync pull request #{} ({} -> {}): {}".format(number, target, dev, url))
+    r = gh("pr", "merge", str(number), "--merge", "--subject", title)
+    if r.returncode != 0:
+        print("The sync PR was NOT merged (conflicts, approvals or checks):\n  {}\nMerge it at {}"
+              .format((r.stderr or r.stdout).strip(), url), file=sys.stderr)
+        return
+    print("{} is now merged back into {}; the picked PRs are no longer ahead of it.".format(target, dev))
 
 
 def main(argv=None) -> int:
@@ -565,6 +633,10 @@ def main(argv=None) -> int:
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would be promoted, change nothing")
     p.add_argument("--no-merge", action="store_true", help="open the pull request but do not merge it")
+    p.add_argument("--no-sync-dev", action="store_true",
+                   help="do not merge main back into development afterwards")
+    p.add_argument("--no-close", action="store_true",
+                   help="do not close picked PRs that GitHub still shows as open")
     p.add_argument("--allow-extra", action="store_true",
                    help="promote even if integrations has commits that are not picked PRs")
     args = p.parse_args(argv)
@@ -722,6 +794,557 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     sys.exit(main())
 PM_EOF_INTEG
+cat > pullreqs/report.py <<'PM_EOF_REPORT'
+#!/usr/bin/env python3
+"""git pullreqs --report: one self-contained HTML dashboard of the PR workflow.
+
+Shows how many pull requests exist and where they are (ready to pick, picked into
+integrations, promoted to main ...), each PR with its author and latest commit
+(id and message), and the numbered trial-integration list that `git drop` prints,
+including a "what would git drop -N remove" simulator.
+
+Data comes from GitHub (gh pr list) and from the local git history.  The file has
+no external dependencies, so it opens offline.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional
+
+from .staging import (StagingError, development_branch, git, gh_available, integrated_merges,
+                      integrations_branch, remote_ref, target_branch, target_ref, working_ref)
+
+PR_FIELDS = "number,title,author,state,baseRefName,headRefName,headRefOid,createdAt"
+
+
+# ---- data ---------------------------------------------------------------
+
+def _load_prs(warnings: List[str]) -> List[dict]:
+    if not gh_available():
+        warnings.append("The GitHub CLI 'gh' is not installed, so the pull request list is empty.")
+        return []
+    data, error = None, ""
+    for fields in (PR_FIELDS + ",commits", PR_FIELDS):      # older gh versions may lack `commits`
+        try:
+            r = subprocess.run(["gh", "pr", "list", "--state", "all", "--limit", "300", "--json", fields],
+                               text=True, capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            error = "gh pr list timed out"
+            continue
+        if r.returncode == 0:
+            data = json.loads(r.stdout or "[]")
+            break
+        error = (r.stderr or r.stdout).strip()
+    if data is None:
+        warnings.append("Could not list pull requests: " + error)
+        return []
+    prs = []
+    for p in data:
+        commits = p.get("commits") or []
+        last = commits[-1] if commits else {}
+        prs.append({
+            "number": p["number"],
+            "title": p.get("title") or "",
+            "author": (p.get("author") or {}).get("login") or "unknown",
+            "state": p.get("state") or "",
+            "base": p.get("baseRefName") or "",
+            "head": p.get("headRefName") or "",
+            "commit": (last.get("oid") or p.get("headRefOid") or "")[:7],
+            "message": last.get("messageHeadline") or "",
+            "created": (p.get("createdAt") or "")[:10],
+        })
+    return sorted(prs, key=lambda x: -x["number"])
+
+
+def _load_integration(by_number: Dict[int, dict], warnings: List[str]) -> dict:
+    name, target = integrations_branch(), target_branch()
+    ref = working_ref()
+    if ref is None:
+        return {"exists": False, "rows": [], "ref": None}
+    tref = target_ref()
+    everything = integrated_merges(ref)
+    pending = {n for n, _, _ in (integrated_merges(ref, not_in=tref) if tref else everything)}
+    remote = remote_ref(name)
+    pushed = set()
+    if remote:
+        pushed = {n for n, _, _ in (integrated_merges(remote, not_in=tref) if tref else integrated_merges(remote))}
+    if tref is None:
+        warnings.append("'{}' was not found, so every picked PR is shown as pending.".format(target))
+
+    rows, position = [], 0
+    for number, sha, short in everything:
+        tested = git("log", "-1", "--format=%h%x09%an%x09%s", sha + "^2", check=False).stdout.strip().split("\t")
+        tested = (tested + ["", "", ""])[:3]
+        pr = by_number.get(number, {})
+        if number in pending:
+            position += 1
+            status = "pushed" if number in pushed else "local"
+        else:
+            status = "main"
+        rows.append({
+            "position": position if number in pending else None,
+            "number": number,
+            "title": pr.get("title") or "",
+            "author": pr.get("author") or tested[1],
+            "commit": tested[0],
+            "message": tested[2],
+            "merge": short,
+            "status": status,
+        })
+    return {"exists": True, "rows": rows, "ref": ref}
+
+
+def collect() -> dict:
+    warnings: List[str] = []
+    dev, name, target = development_branch(), integrations_branch(), target_branch()
+    prs = _load_prs(warnings)
+    integration = _load_integration({p["number"]: p for p in prs}, warnings)
+
+    stage = {r["number"]: r["status"] for r in integration["rows"]}
+    for p in prs:
+        s = stage.get(p["number"])
+        if s == "main":
+            p["status"] = "promoted"
+        elif s == "pushed":
+            p["status"] = "integrations"
+        elif s == "local":
+            p["status"] = "picked"
+        elif p["state"] == "MERGED":
+            p["status"] = "merged"
+        elif p["state"] == "CLOSED":
+            p["status"] = "closed"
+        elif p["base"] != dev:
+            p["status"] = "wrong-target"
+        else:
+            p["status"] = "ready"
+
+    try:
+        repo = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                              text=True, capture_output=True, timeout=20).stdout.strip() if gh_available() else ""
+    except subprocess.TimeoutExpired:
+        repo = ""
+    if not repo:
+        url = git("remote", "get-url", "origin", check=False).stdout.strip()
+        repo = url.rstrip("/").removesuffix(".git").split("github.com")[-1].lstrip(":/") if url else "this repository"
+    return {
+        "repo": repo, "generated": time.strftime("%Y-%m-%d %H:%M"), "demo": False,
+        "branches": {"development": dev, "integrations": name, "main": target},
+        "prs": prs, "integration": integration, "warnings": warnings,
+    }
+
+
+# ---- page ---------------------------------------------------------------
+
+def render(data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False).replace("&", "\\u0026").replace("<", "\\u003c") \
+        .replace(">", "\\u003e").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return TEMPLATE.replace("__DATA__", payload)
+
+
+def write_report(path: str, data: Optional[dict] = None) -> str:
+    html = render(data if data is not None else collect())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return os.path.abspath(path)
+
+
+def windows_path(path: str) -> Optional[str]:
+    """In WSL, the path a Windows browser can open."""
+    if shutil.which("wslpath"):
+        r = subprocess.run(["wslpath", "-w", path], text=True, capture_output=True)
+        return r.stdout.strip() or None
+    return None
+
+
+TEMPLATE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pull Request Report</title>
+<style>
+:root{
+  --bg:#f6f7f9; --surface:#fff; --ink:#15191e; --muted:#5b6672; --line:#e2e6ea; --accent:#0b6bcb;
+  --ready:#0b6bcb; --ready-bg:#e6f0fb; --picked:#9a5b00; --picked-bg:#fdf0da;
+  --integ:#5b3fc4; --integ-bg:#ece8fa; --done:#1a7f45; --done-bg:#e3f4ea;
+  --bad:#b42318; --bad-bg:#fdeceb; --grey:#56606b; --grey-bg:#eceff2;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0e1216; --surface:#161b21; --ink:#e8ecf0; --muted:#97a3af; --line:#27303a; --accent:#5aa7ff;
+    --ready:#7db8ff; --ready-bg:#12273f; --picked:#f0b45b; --picked-bg:#33260f;
+    --integ:#b6a4ff; --integ-bg:#241e47; --done:#5fd08d; --done-bg:#12301f;
+    --bad:#ff8d83; --bad-bg:#3a1a17; --grey:#a2adb8; --grey-bg:#222a32;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0e1216; --surface:#161b21; --ink:#e8ecf0; --muted:#97a3af; --line:#27303a; --accent:#5aa7ff;
+  --ready:#7db8ff; --ready-bg:#12273f; --picked:#f0b45b; --picked-bg:#33260f;
+  --integ:#b6a4ff; --integ-bg:#241e47; --done:#5fd08d; --done-bg:#12301f;
+  --bad:#ff8d83; --bad-bg:#3a1a17; --grey:#a2adb8; --grey-bg:#222a32;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 16px 56px}
+header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;justify-content:space-between;margin-bottom:22px}
+h1{font-size:26px;line-height:1.2;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:14px}
+.flow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-family:var(--mono);font-size:13px}
+.flow span.b{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+.flow span.a{color:var(--muted)}
+button.theme{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 10px;font:inherit;font-size:13px;cursor:pointer}
+.banner{border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:14px}
+.banner.demo{background:var(--picked-bg);color:var(--picked);border:1px solid var(--picked)}
+.banner.warn{background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.tile .n{font-size:32px;font-weight:650;line-height:1.1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.tile .l{color:var(--muted);font-size:13px;margin-top:2px}
+.tile .h{font-size:12px;color:var(--muted);margin-top:6px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 16px 12px;margin-bottom:18px}
+.card h2{font-size:17px;margin:0 0 2px}
+.card .hint{color:var(--muted);font-size:13px;margin:0 0 12px}
+.bar{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--grey-bg);margin:10px 0 8px}
+.bar i{display:block;height:100%}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--muted)}
+.legend b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.chip{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+input[type=search],input[type=number]{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit;font-size:14px}
+input[type=search]{min-width:220px;margin-left:auto}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+.sha{background:var(--grey-bg);border-radius:4px;padding:1px 6px}
+.msg{color:var(--muted);display:block;margin-top:2px;max-width:46ch}
+.st{display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;white-space:nowrap}
+.st.ready{background:var(--ready-bg);color:var(--ready)} .st.picked{background:var(--picked-bg);color:var(--picked)}
+.st.integrations{background:var(--integ-bg);color:var(--integ)} .st.promoted{background:var(--done-bg);color:var(--done)}
+.st.wrong-target{background:var(--bad-bg);color:var(--bad)} .st.merged,.st.closed{background:var(--grey-bg);color:var(--grey)}
+.pos{display:inline-grid;place-items:center;min-width:28px;height:28px;border-radius:50%;background:var(--ink);color:var(--surface);font-weight:650;font-size:13px}
+tr.dropping td{background:var(--bad-bg)} tr.dropping .pos{background:var(--bad);color:#fff}
+tr.dropping td.title{text-decoration:line-through;text-decoration-color:var(--bad)}
+tr.kept td{background:var(--done-bg)}
+tr.released td{opacity:.65}
+.sim{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;font-size:14px}
+.sim output{font-family:var(--mono);font-size:13px;background:var(--grey-bg);border-radius:6px;padding:3px 9px}
+.empty{color:var(--muted);padding:18px 4px;font-size:14px}
+.cmds{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:6px 24px;font-size:13px;color:var(--muted)}
+.cmds code{color:var(--ink)}
+@media (max-width:640px){.tile .n{font-size:26px} input[type=search]{margin-left:0;width:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Pull request report</h1>
+      <div class="sub" id="sub"></div>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <div class="flow" id="flow" aria-label="Branch flow"></div>
+      <button class="theme" id="theme" type="button" aria-label="Toggle dark mode">Light / dark</button>
+    </div>
+  </header>
+  <div id="banners"></div>
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="card" aria-labelledby="h-where">
+    <h2 id="h-where">Where the pull requests are</h2>
+    <p class="hint">Every PR in the repository, by stage of the workflow.</p>
+    <div class="bar" id="bar" role="img" aria-label="Pull requests by stage"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-prs">
+    <h2 id="h-prs">Pull requests</h2>
+    <p class="hint">Author, and the latest commit of each pull request (id and message).</p>
+    <div class="tools" id="tools"></div>
+    <div class="scroll"><table id="prs">
+      <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="empty" id="prs-empty" hidden>No pull requests match.</div>
+  </section>
+
+  <section class="card" aria-labelledby="h-drop">
+    <h2 id="h-drop">Drops: the trial integration <span class="sub" style="font-weight:400">(what <code>git drop</code> lists)</span></h2>
+    <p class="hint">Numbered in the order the PRs were picked. <code>git drop -N</code> removes the first N <em>positions</em>, not PR numbers.</p>
+    <div class="sim" id="sim"></div>
+    <div class="scroll"><table id="drops">
+      <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="empty" id="drops-empty" hidden></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-cmds">
+    <h2 id="h-cmds">Commands</h2>
+    <div class="cmds">
+      <div><code>git pullreqs --oneline</code> list PRs</div>
+      <div><code>git pullreqs -p 12 14</code> pick PRs</div>
+      <div><code>git push</code> publish the picks</div>
+      <div><code>git drop</code> numbered list</div>
+      <div><code>git drop -3</code> drop positions 1-3</div>
+      <div><code>git push-master -m "msg"</code> promote to main</div>
+    </div>
+  </section>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var D = JSON.parse(document.getElementById("data").textContent);
+  var B = D.branches, prs = D.prs, rows = D.integration.rows;
+  var STAGES = [
+    ["ready", "Ready to pick", "--ready"], ["picked", "Picked, not pushed", "--picked"],
+    ["integrations", "In integrations", "--integ"], ["promoted", "Promoted to main", "--done"],
+    ["wrong-target", "Wrong target branch", "--bad"], ["merged", "Merged", "--grey"], ["closed", "Closed", "--grey"]
+  ];
+  var LABEL = {}; STAGES.forEach(function (s) { LABEL[s[0]] = s[1]; });
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function count(status) { return prs.filter(function (p) { return p.status === status; }).length; }
+  function sha(s) { return s ? el("code", "sha", s) : el("span", "msg", "-"); }
+
+  // header
+  document.getElementById("sub").textContent = D.repo + "  ·  generated " + D.generated;
+  var flow = document.getElementById("flow");
+  [B.development, B.integrations, B.main].forEach(function (b, i) {
+    if (i) flow.appendChild(el("span", "a", "→"));
+    flow.appendChild(el("span", "b", b));
+  });
+  var banners = document.getElementById("banners");
+  if (D.demo) banners.appendChild(el("div", "banner demo", "Sample data - this page only shows the layout. Run  git pullreqs --report  in your repository for real numbers."));
+  D.warnings.forEach(function (w) { banners.appendChild(el("div", "banner warn", w)); });
+
+  // tiles
+  var pending = rows.filter(function (r) { return r.position !== null; });
+  var notPushed = pending.filter(function (r) { return r.status === "local"; }).length;
+  var open = prs.filter(function (p) { return p.state === "OPEN"; }).length;
+  var tiles = [
+    [prs.length, "Pull requests", open + " open"],
+    [count("ready"), "Ready to pick", "open, target " + B.development],
+    [pending.length, "In trial integration", notPushed ? notPushed + " not pushed yet" : "all pushed"],
+    [count("promoted") + rows.filter(function (r) { return r.status === "main" && !prs.some(function (p) { return p.number === r.number; }); }).length, "Promoted to " + B.main, "via git push-master"],
+    [count("wrong-target"), "Wrong target", count("wrong-target") ? "retarget to " + B.development : "none"]
+  ];
+  var tl = document.getElementById("tiles");
+  tiles.forEach(function (t) {
+    var d = el("div", "tile");
+    d.appendChild(el("div", "n", String(t[0])));
+    d.appendChild(el("div", "l", t[1]));
+    d.appendChild(el("div", "h", t[2]));
+    tl.appendChild(d);
+  });
+
+  // stage bar + legend
+  var bar = document.getElementById("bar"), legend = document.getElementById("legend");
+  STAGES.forEach(function (s) {
+    var n = count(s[0]);
+    if (!n) return;
+    var seg = el("i"); seg.style.width = (100 * n / prs.length) + "%"; seg.style.background = "var(" + s[2] + ")"; seg.title = s[1] + ": " + n;
+    bar.appendChild(seg);
+    var item = el("span"); var sw = el("span", "sw"); sw.style.background = "var(" + s[2] + ")";
+    item.appendChild(sw); item.appendChild(document.createTextNode(s[1] + " ")); item.appendChild(el("b", null, String(n)));
+    legend.appendChild(item);
+  });
+  if (!prs.length) { bar.hidden = true; legend.appendChild(el("span", null, "No pull requests found.")); }
+
+  // PR table with filters
+  var filter = "all", query = "";
+  var tools = document.getElementById("tools");
+  var chips = [["all", "All"]].concat(STAGES.filter(function (s) { return count(s[0]); }).map(function (s) { return [s[0], s[1]]; }));
+  chips.forEach(function (c) {
+    var b = el("button", "chip", c[1] + " " + (c[0] === "all" ? prs.length : count(c[0]))); b.type = "button";
+    b.setAttribute("aria-pressed", c[0] === "all" ? "true" : "false");
+    b.addEventListener("click", function () {
+      filter = c[0];
+      Array.prototype.forEach.call(tools.querySelectorAll(".chip"), function (x) { x.setAttribute("aria-pressed", "false"); });
+      b.setAttribute("aria-pressed", "true"); drawPRs();
+    });
+    tools.appendChild(b);
+  });
+  var search = el("input"); search.type = "search"; search.placeholder = "Search"; search.setAttribute("aria-label", "Search pull requests");
+  search.addEventListener("input", function () { query = search.value.trim().toLowerCase(); drawPRs(); });
+  tools.appendChild(search);
+
+  function drawPRs() {
+    var tb = document.querySelector("#prs tbody"); tb.textContent = "";
+    var shown = prs.filter(function (p) {
+      if (filter !== "all" && p.status !== filter) return false;
+      if (!query) return true;
+      return ("#" + p.number + " " + p.title + " " + p.author + " " + p.commit + " " + p.message + " " + p.head).toLowerCase().indexOf(query) >= 0;
+    });
+    shown.forEach(function (p) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "num", "#" + p.number));
+      tr.appendChild(el("td", "title", p.title));
+      tr.appendChild(el("td", null, p.author));
+      var br = el("td"); br.appendChild(el("code", null, p.head)); br.appendChild(el("span", "msg", "→ " + p.base)); tr.appendChild(br);
+      var cm = el("td"); cm.appendChild(sha(p.commit)); cm.appendChild(el("span", "msg", p.message || "-")); tr.appendChild(cm);
+      var st = el("td"); st.appendChild(el("span", "st " + p.status, LABEL[p.status] || p.status)); tr.appendChild(st);
+      tb.appendChild(tr);
+    });
+    document.getElementById("prs-empty").hidden = shown.length > 0;
+    document.getElementById("prs").hidden = shown.length === 0;
+  }
+  drawPRs();
+
+  // drops: numbered list + git drop -N simulator
+  var sim = document.getElementById("sim");
+  var input = el("input"); input.type = "number"; input.min = "0"; input.max = String(pending.length); input.value = "0"; input.id = "n";
+  input.setAttribute("aria-label", "Number of PRs to drop");
+  var lab = el("label", null, "If I run  git drop -"); lab.setAttribute("for", "n");
+  var out = el("output"); out.setAttribute("aria-live", "polite");
+  sim.appendChild(lab); sim.appendChild(input); sim.appendChild(out);
+  if (!pending.length) sim.hidden = true;
+
+  function drawDrops() {
+    var n = Math.max(0, Math.min(pending.length, parseInt(input.value, 10) || 0));
+    var tb = document.querySelector("#drops tbody"); tb.textContent = "";
+    rows.forEach(function (r) {
+      var tr = el("tr");
+      if (r.position === null) tr.className = "released";
+      else if (n && r.position <= n) tr.className = "dropping";
+      else if (n) tr.className = "kept";
+      var p = el("td"); if (r.position !== null) p.appendChild(el("span", "pos", String(r.position))); else p.appendChild(el("span", "msg", "-")); tr.appendChild(p);
+      tr.appendChild(el("td", "num", "#" + r.number));
+      tr.appendChild(el("td", "title", r.title || "-"));
+      tr.appendChild(el("td", null, r.author));
+      var c = el("td"); c.appendChild(sha(r.commit)); c.appendChild(el("span", "msg", r.message || "-")); tr.appendChild(c);
+      var m = el("td"); m.appendChild(sha(r.merge)); tr.appendChild(m);
+      var s = el("td");
+      var cls = r.status === "main" ? "promoted" : (r.status === "pushed" ? "integrations" : "picked");
+      var txt = r.status === "main" ? "In " + B.main : (r.status === "pushed" ? "Pushed" : "Local only");
+      s.appendChild(el("span", "st " + cls, txt)); tr.appendChild(s);
+      tb.appendChild(tr);
+    });
+    if (!pending.length) out.textContent = "";
+    else if (!n) out.textContent = "nothing is dropped";
+    else {
+      var gone = pending.slice(0, n).map(function (r) { return "#" + r.number; }).join(", ");
+      var kept = pending.slice(n).map(function (r) { return "#" + r.number; }).join(", ");
+      out.textContent = "drops positions 1-" + n + " (" + gone + "); keeps " + (kept || "nothing");
+    }
+  }
+  input.addEventListener("input", drawDrops);
+  drawDrops();
+  var de = document.getElementById("drops-empty");
+  if (!D.integration.exists) { de.hidden = false; de.textContent = "The integrations branch does not exist yet. Pick PRs first:  git pullreqs -p <PR numbers>"; document.getElementById("drops").hidden = true; }
+  else if (!rows.length) { de.hidden = false; de.textContent = "Nothing is picked into " + B.integrations + " yet."; document.getElementById("drops").hidden = true; }
+  else if (!pending.length) { de.hidden = false; de.textContent = "Nothing pending: everything picked is already in " + B.main + ". Earlier PRs are shown dimmed."; }
+
+  // theme toggle
+  var root = document.documentElement;
+  document.getElementById("theme").addEventListener("click", function () {
+    var dark = root.getAttribute("data-theme") === "dark" ||
+      (!root.getAttribute("data-theme") && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    root.setAttribute("data-theme", dark ? "light" : "dark");
+  });
+})();
+</script>
+</body>
+</html>
+'''
+PM_EOF_REPORT
+cat > pullreqs/create.py <<'PM_EOF_CREATE'
+"""git pullreqs --create: push the current branch and open a pull request against development.
+
+    git pullreqs --create                     title and description from your commits
+    git pullreqs --create -t "Add auth"       explicit title
+    git pullreqs --create --draft             open it as a draft
+    git pullreqs --create -- --label qa       anything after -- goes to `gh pr create`
+
+The base is always the development branch, so the PR can be picked later with
+`git pullreqs -p <number>` (which refuses PRs that target anything else).
+"""
+import re
+import shutil
+import subprocess
+from typing import List, Optional
+
+from .staging import (StagingError, development_branch, git, integrations_branch, remote_name,
+                      target_branch)
+
+
+def _gh(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh", *args], text=True, capture_output=True)
+
+
+def create_pr(title: Optional[str] = None, draft: bool = False, extra: Optional[List[str]] = None) -> int:
+    if not shutil.which("gh"):
+        raise StagingError("The GitHub CLI 'gh' is required (sudo apt install gh; gh auth login).")
+    branch = git("branch", "--show-current", check=False).stdout.strip()
+    if not branch:
+        raise StagingError("You are on a detached HEAD. Switch to your feature branch first.")
+    dev, remote = development_branch(), remote_name()
+    protected = {dev, integrations_branch(), target_branch()}
+    if branch in protected:
+        raise StagingError("'{}' is a shared branch. Create a feature branch first:\n"
+                           "  git switch -c feature-name {}/{}".format(branch, remote, dev))
+
+    if git("ls-remote", "--exit-code", "--heads", remote, dev, check=False).returncode != 0:
+        raise StagingError("{}/{} does not exist. Create it once with:\n"
+                           "  git push {} {}/{}:refs/heads/{}".format(remote, dev, remote, remote, target_branch(), dev))
+
+    # a PR needs at least one commit that development does not have
+    git("fetch", remote, dev, check=False)
+    ahead = git("rev-list", "--count", "{}/{}..HEAD".format(remote, dev), check=False).stdout.strip()
+    if ahead == "0":
+        raise StagingError("'{}' has no commits that {}/{} lacks, so there is nothing to open a PR for.".format(
+            branch, remote, dev))
+
+    print("Pushing {} to {} ...".format(branch, remote))
+    r = git("push", "-u", remote, branch, check=False)
+    if r.returncode != 0:
+        raise StagingError("git push failed:\n" + (r.stderr or r.stdout).strip())
+
+    r = _gh("pr", "list", "--head", branch, "--state", "open", "--json", "number,url,baseRefName")
+    if r.returncode != 0:
+        raise StagingError("Could not list pull requests:\n" + (r.stderr or r.stdout).strip())
+    import json
+    for pr in json.loads(r.stdout or "[]"):
+        if pr["baseRefName"] == dev:
+            print("A pull request for this branch is already open: #{} {}".format(pr["number"], pr["url"]))
+            return 0
+        raise StagingError("PR #{} for this branch targets '{}', not '{}'. Retarget it:\n"
+                           "  gh api -X PATCH repos/{{owner}}/{{repo}}/pulls/{} -f base={}".format(
+                               pr["number"], pr["baseRefName"], dev, pr["number"], dev))
+
+    cmd = ["pr", "create", "--base", dev, "--head", branch]
+    cmd += ["--title", title] if title else ["--fill"]
+    if title:
+        cmd += ["--body", ""]
+    if draft:
+        cmd.append("--draft")
+    cmd += list(extra or [])
+    r = _gh(*cmd)
+    if r.returncode != 0:
+        raise StagingError("Could not create the pull request:\n" + (r.stderr or r.stdout).strip())
+    url = r.stdout.strip().splitlines()[-1]
+    m = re.search(r"/pull/(\d+)", url)
+    print("Created pull request {}into {}: {}".format("#%s " % m.group(1) if m else "", dev, url))
+    if m:
+        print("QA can pick it with:  git pullreqs -p {}".format(m.group(1)))
+    return 0
+PM_EOF_CREATE
 cat > pullreqs/cli.py <<'PM_EOF_CLI'
 import argparse
 import sys
@@ -748,8 +1371,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--sync", action="store_true",
                    help="assign custom IDs to existing PRs that have none (oldest native id first)")
     g.add_argument("--create", action="store_true",
-                   help="create a PR via pullreqs.createCommand, then assign the next custom ID "
-                        "(extra args after `--` are passed to the create command)")
+                   help="push the current branch and open a PR against development "
+                        "(extra args after `--` go to `gh pr create`)")
+    g.add_argument("--report", action="store_true",
+                   help="write an HTML dashboard: PR counts, authors, latest commits and the drop list")
+    p.add_argument("-o", "--output", default="pullreqs-report.html", metavar="FILE",
+                   help="with --report: the file to write (default: pullreqs-report.html)")
+    p.add_argument("-t", "--title", metavar="TITLE", help="with --create: the PR title (default: from your commits)")
+    p.add_argument("--draft", action="store_true", help="with --create: open the PR as a draft")
     return p
 
 
@@ -811,6 +1440,18 @@ def cmd_pick(tokens: List[str]):
     print("  git drop -N                      drop the first N of that list")
 
 
+def cmd_report(output: str):
+    from .report import windows_path, write_report
+    from .staging import fetch
+    if not fetch():
+        print("warning: could not reach the remote; using the last fetched state.", file=sys.stderr)
+    path = write_report(output)
+    print("Report written: {}".format(path))
+    win = windows_path(path)
+    if win:
+        print("Open it in Windows: {}".format(win))
+
+
 def cmd_sync(provider, store):
     ids = store.load(refresh=True)
     missing = sorted({p.native_id for p in provider.list()} - ids.keys(), key=int)
@@ -821,10 +1462,9 @@ def cmd_sync(provider, store):
         print(f"{custom}  <-  {native}")
 
 
-def cmd_create(provider, store, extra):
-    native = provider.create(extra)
-    custom = store.allocate([native])[native]
-    print(f"Created PR: native {native}, custom {custom}")
+def cmd_create(args, extra):
+    from .create import create_pr
+    return create_pr(args.title, args.draft, extra)
 
 
 def main(argv=None) -> int:
@@ -837,6 +1477,11 @@ def main(argv=None) -> int:
         if args.pick is not None:
             cmd_pick(args.pick)
             return 0
+        if args.report:
+            cmd_report(args.output)
+            return 0
+        if args.create:
+            return cmd_create(args, extra)
         cfg = load_config()
         provider = ShellProvider(cfg)
         store = IdStore(cfg.remote, cfg.ref, cfg.first_id)
@@ -844,8 +1489,6 @@ def main(argv=None) -> int:
             cmd_oneline(provider, store)
         elif args.sync:
             cmd_sync(provider, store)
-        else:
-            cmd_create(provider, store, extra)
         return 0
     except (PullreqsError, StagingError) as e:
         print(f"git pullreqs: {e}", file=sys.stderr)
@@ -905,8 +1548,18 @@ Branch names can be changed: `git config pullreqs.developmentBranch dev`,
 ### git push-master -m "message"
 * Promotes what is on **origin/integrations**. Refuses if your local branch differs from it (unpushed picks, or a drop not yet pushed), so what is promoted is what you validated.
 * Refuses commits on integrations that did not come through `git pullreqs -p` (`--allow-extra` overrides).
-* Opens a pull request integrations -> main and merges it with a **merge commit**, using your message. All original commits stay in history, and GitHub marks the picked PRs as merged. Dropped PRs are not promoted.
+* Opens a pull request integrations -> main and merges it with a **merge commit**, using your message. All original commits stay in history.  Dropped PRs are not promoted.
+* Afterwards it opens and merges a second PR **main -> development**, so development has the promotion commit and GitHub marks the picked PRs as merged. If that step fails the promotion still stands and it tells you what to do. `--no-sync-dev` skips it.
+* Any picked PR that GitHub still shows as open after that is closed with a comment (they target `development`, so GitHub does not always mark them merged). `--no-close` leaves them open.
 * If `main` needs approvals or checks, the PR stays open (exit code 2); merge it on GitHub. `--no-merge` opens it only, `--dry-run` shows the plan.
+
+### git pullreqs --create [-t TITLE] [--draft]
+* Run it on your feature branch: pushes the branch and opens a PR **against development** (title and description from your commits, or `-t`). Prints the PR number QA will use with `-p`.
+* Refuses on `development`, `integrations` or `main`, when there is nothing new to propose, or when the branch's open PR targets another branch. If a PR is already open it just shows it. Extra `gh pr create` options go after `--`, e.g. `-- --label qa`.
+
+### git pullreqs --report [-o FILE]
+* Writes one self-contained HTML dashboard (default `pullreqs-report.html`): PR counts, each PR's author, branch, latest commit id and message, its stage (ready, picked, in integrations, promoted, wrong target, merged, closed), and the numbered **Drops** list (what `git drop` shows) with a `git drop -N` simulator.
+* Needs `gh` logged in. Open the file in a browser; on WSL the Windows path is printed.
 
 ## Good to know
 * A conflict while picking stops with the PR named. Fix and `git commit --no-edit`, or `git merge --abort`.

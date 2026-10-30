@@ -9,6 +9,7 @@ git_pullreqs.egg-info/top_level.txt
 pullreqs/__init__.py
 pullreqs/cli.py
 pullreqs/config.py
+pullreqs/create.py
 pullreqs/drop.py
 pullreqs/errors.py
 pullreqs/ids.py
@@ -17,6 +18,7 @@ pullreqs/integration.py
 pullreqs/parser.py
 pullreqs/provider.py
 pullreqs/push_master.py
+pullreqs/report.py
 pullreqs/staging.py
 tests/test_idstore.py
 tests/test_parser.py
