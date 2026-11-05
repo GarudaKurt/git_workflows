@@ -148,9 +148,20 @@ def render(data: dict) -> str:
 
 
 def write_report(path: str, data: Optional[dict] = None) -> str:
+    path = os.path.expanduser(path)
+    if os.path.isdir(path):
+        path = os.path.join(path, "pullreqs-report.html")     # -o ~/folder -> ~/folder/pullreqs-report.html
+    elif not os.path.splitext(path)[1]:
+        path += ".html"                                       # -o ~/PR -> ~/PR.html
     html = render(data if data is not None else collect())
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+    folder = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(folder, exist_ok=True)                    # create missing folders
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+    except OSError as e:
+        from .staging import StagingError
+        raise StagingError("Cannot write the report to {}: {}".format(path, e.strerror or e))
     return os.path.abspath(path)
 
 

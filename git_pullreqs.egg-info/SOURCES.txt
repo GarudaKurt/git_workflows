@@ -19,6 +19,7 @@ pullreqs/parser.py
 pullreqs/provider.py
 pullreqs/push_master.py
 pullreqs/report.py
+pullreqs/smartfix.py
 pullreqs/staging.py
 tests/test_idstore.py
 tests/test_parser.py
