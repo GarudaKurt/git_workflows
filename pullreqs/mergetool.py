@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""git smartfix: fix the easy merge conflicts automatically, point at the hard ones.
+"""smartfix-mergetool: a merge tool for `git mergetool` that fixes the easy conflicts by itself.
 
-    git smartfix                 fix every conflicted file, stage the fully fixed ones
-    git smartfix FILE...         only these files
-    git smartfix --dry-run       show what would be fixed, change nothing
-    git smartfix --strict        only the clearly safe fixes (no "review" fixes)
-    git smartfix --mergetool     afterwards open `git mergetool` for what is left
-    git smartfix --install-tool  register the "smartfix" tool for `git mergetool`
+There is no separate command to run.  The installer registers this program as the
+default merge tool (it runs `smartfix-mergetool --auto`), and from then on only this is
+needed, whenever a merge, rebase or cherry-pick stops on conflicts:
 
-How it works.  For each conflicted file it takes the three versions git keeps
-in the index (common ancestor, ours, theirs) and merges them itself, hunk by
-hunk, sorting every conflict into one of three kinds:
+    git mergetool
+
+For every conflicted file git calls this tool with the common ancestor (BASE),
+ours (LOCAL), theirs (REMOTE) and the file to write (MERGED).  Phase 1 merges the
+three versions hunk by hunk and sorts every conflict into one of three kinds:
 
   safe     applied.   Both sides made the same change; they differ only in
                       whitespace; both added entries to a list (imports,
                       .gitignore, requirements, bullet points).
   review   applied, and listed so you can glance at it.  Edits on neighbouring
-                      lines; different words changed on the same line; one side
-                      only reformatted; a change that already contains the
-                      other side's change; both sides added different code at
-                      the same spot.
+                      lines; different words changed on the same line; a comment
+                      added next to an edited value; one side only reformatted; a
+                      change that already contains the other side's change; both
+                      sides added different code at the same spot.
   manual   NOT applied.  Both sides changed the same lines differently, one
-                      side deleted what the other edited, binary files,
-                      lock files.  You get a recommendation, and the hunk is
-                      left in the file with conflict markers (with the common
-                      ancestor shown) for you to fix by hand.
+                      side deleted what the other edited, two different numbers,
+                      binary files, lock files.
 
-Nothing is lost: undo a file with   git checkout --merge -- FILE
-A file you already edited by hand is left alone (use --force to redo it).
+If every conflict in the file was fixed, the tool exits and git moves on: no
+window, no question.  Otherwise phase 2: it prints what each side did and a
+recommendation, then lets you fix the rest by hand: your editor, or a visual tool
+(smartfix.fallbackTool = vimdiff | nvimdiff | meld | code | kdiff3).  MERGED then
+already contains the automatic fixes, and only the conflicts that are left sit
+between <<<<<<< and >>>>>>> markers, with the original lines after |||||||.
 
-As a mergetool:   git smartfix --install-tool   then   git mergetool --tool=smartfix
-Easy conflicts are fixed; for the hard ones it prints the recommendation and opens
-your editor (or smartfix.fallbackCmd, e.g.  meld "$LOCAL" "$BASE" "$REMOTE" --output "$MERGED").
+Settings (git config):  smartfix.fallbackTool, smartfix.fallbackCmd,
+smartfix.level (safe = only the clearly safe fixes), smartfix.interactive.
 """
 import argparse
 import difflib
@@ -42,7 +42,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 SAFE, REVIEW = "safe", "review"
 ENC = "utf-8"
@@ -185,6 +185,8 @@ class Seg:
     base: List[str] = field(default_factory=list)
     theirs: List[str] = field(default_factory=list)
     hint: str = ""
+    chosen: Optional[List[str]] = None      # set when the user (or --prefer) picked a resolution
+    choice: str = ""
 
 
 def _tokens(lines: List[str]) -> List[str]:
@@ -198,7 +200,17 @@ def _merge_tokens(b: List[str], o: List[str], t: List[str]) -> Optional[List[str
         return None
     out: List[str] = []
     pos = 0
-    for cl in _clusters(_changes(bt, ot), _changes(bt, tt), touch=True):
+    cls = _clusters(_changes(bt, ot), _changes(bt, tt), touch=False)
+
+    def text(cl: Cluster) -> str:
+        return "".join(_side(bt, ot if cl.o else tt, cl.o or cl.t, cl.lo, cl.hi))
+
+    for a, b in zip(cls, cls[1:]):             # neighbouring edits are fine only like  `x = 1`  ->  `x = 5 # note`
+        if a.adj_note:
+            ok = (a.lo == a.hi and text(a)[-1:].isspace()) or (b.lo == b.hi and text(b)[:1].isspace())
+            if not ok:
+                return None
+    for cl in cls:
         ot_txt, tt_txt = _side(bt, ot, cl.o, cl.lo, cl.hi), _side(bt, tt, cl.t, cl.lo, cl.hi)
         if cl.o and cl.t and ot_txt != tt_txt:
             return None
@@ -331,7 +343,10 @@ def render(segs: List[Seg], eol: str = "\n") -> Tuple[List[str], List[Tuple[int,
     fixes: List[Tuple[int, Seg]] = []
     hards: List[Tuple[int, Seg]] = []
     for s in segs:
-        if s.kind == "hard":
+        if s.kind == "hard" and s.chosen is not None:
+            fixes.append((len(out) + 1, Seg("fix", level="chosen", message=s.choice)))
+            out += s.chosen
+        elif s.kind == "hard":
             hards.append((len(out) + 1, s))
             out += ["<<<<<<< ours" + eol] + ensure_nl(s.ours, eol) + ["||||||| base" + eol] + ensure_nl(s.base, eol)
             out += ["=======" + eol] + ensure_nl(s.theirs, eol) + [">>>>>>> theirs" + eol]
@@ -353,6 +368,9 @@ class Result:
     fixes: List[Tuple[int, str, str]] = field(default_factory=list)       # (line, level, message)
     hards: List[Tuple[int, int, str, str, str]] = field(default_factory=list)   # (from, to, ours, theirs, hint)
     note: str = ""
+    segs: List[Seg] = field(default_factory=list)
+    eol: str = "\n"
+    nl_end: bool = True                 # output keeps a final newline
 
 
 def _eol_of(text: str) -> str:
@@ -363,38 +381,132 @@ def _is_binary(b: bytes) -> bool:
     return b"\0" in b[:8000]
 
 
-def resolve_bytes(path: str, base_b: Optional[bytes], ours_b: bytes, theirs_b: bytes, strict: bool = False) -> Result:
-    res = Result(path)
-    if any(_is_binary(x) for x in (ours_b, theirs_b, base_b or b"")):
-        res.note = ("binary file: choose a side with  git checkout --ours -- {0}  or  git checkout --theirs -- {0}"
-                    "  then  git add {0}".format(shlex.quote(path)))
-        return res
-    base_name = os.path.basename(path).lower()
-    lock = LOCK_FILES.get(base_name)
-    base = split_lines((base_b or b"").decode(ENC, ERR))
-    ours = split_lines(ours_b.decode(ENC, ERR))
-    theirs = split_lines(theirs_b.decode(ENC, ERR))
-    eol = _eol_of(ours_b.decode(ENC, ERR))
-    ctx = Ctx(name=path, has_base=base_b is not None and len(base_b) > 0, strict=strict or bool(lock), eol=eol)
-    segs = merge3(base, ours, theirs, ctx)
-    lines, fixes, hards = render(segs, eol)
-    if lock and hards:
-        res.note = ("lock file: do not merge by hand. Keep one side, then regenerate it:  git checkout --theirs -- {0}"
-                    "  &&  {1}  &&  git add {0}".format(shlex.quote(path), lock))
-        return res
+def _lacks_nl(lines: List[str]) -> bool:
+    return bool(lines) and not lines[-1].endswith("\n")
+
+
+def build(res: Result, final: bool = False) -> Result:
+    """(Re)compute the output of res from its segments. final=True: also keep it when nothing was auto-fixed."""
+    lines, fixes, hards = render(res.segs, res.eol)
+    if not res.nl_end and lines and not hards and lines[-1].endswith(res.eol):
+        lines[-1] = lines[-1][: -len(res.eol)]
+    elif not res.nl_end and lines and hards and lines[-1].endswith(res.eol) and not lines[-1].startswith(">>>>>>>"):
+        lines[-1] = lines[-1][: -len(res.eol)]
     res.fixes = [(ln, s.level, s.message) for ln, s in fixes]
+    res.hards = []
     for ln, s in hards:
         span = len(ensure_nl(s.ours)) + len(ensure_nl(s.base)) + len(ensure_nl(s.theirs)) + 4
         res.hards.append((ln, ln + span - 1, _preview(s.ours), _preview(s.theirs), s.hint))
     res.data = "".join(lines).encode(ENC, ERR)
     if not hards:
         res.status = "resolved"
-    elif fixes:
-        res.status = "partial"
+    elif fixes or final:
+        res.status = "partial" if fixes else "manual"
     else:
         res.status = "manual"
         res.data = None
     return res
+
+
+def resolve_bytes(path: str, base_b: Optional[bytes], ours_b: bytes, theirs_b: bytes, strict: bool = False,
+                  has_base: Optional[bool] = None) -> Result:
+    res = Result(path)
+    if any(_is_binary(x) for x in (ours_b, theirs_b, base_b or b"")):
+        res.note = ("binary file: choose a side with  git checkout --ours -- {0}  or  git checkout --theirs -- {0}"
+                    "  then  git add {0}".format(shlex.quote(path)))
+        return res
+    lock = LOCK_FILES.get(os.path.basename(path).lower())
+    base = split_lines((base_b or b"").decode(ENC, ERR))
+    ours = split_lines(ours_b.decode(ENC, ERR))
+    theirs = split_lines(theirs_b.decode(ENC, ERR))
+    eol = _eol_of(ours_b.decode(ENC, ERR))
+    # a missing final newline must not turn "both appended a line" into a conflict on the last line
+    res.nl_end = not (_lacks_nl(ours) and _lacks_nl(theirs))
+    base, ours, theirs = (ensure_nl(x, eol) for x in (base, ours, theirs))
+    if has_base is None:
+        has_base = base_b is not None
+    ctx = Ctx(name=path, has_base=has_base, strict=strict or bool(lock), eol=eol)
+    res.segs = merge3(base, ours, theirs, ctx)
+    res.eol = eol
+    build(res)
+    if lock and res.hards:
+        res.note = ("lock file: do not merge by hand. Keep one side, then regenerate it:  git checkout --theirs -- {0}"
+                    "  &&  {1}  &&  git add {0}".format(shlex.quote(path), lock))
+        res.status, res.data, res.fixes, res.hards, res.segs = "manual", None, [], [], []
+    return res
+
+
+# ---------------------------------------------------------------- choosing for the hard hunks
+
+def _combine(seg: Seg, how: str, eol: str) -> List[str]:
+    if how == "ours":
+        return list(seg.ours)
+    if how == "theirs":
+        return list(seg.theirs)
+    if how == "both":
+        return ensure_nl(seg.ours, eol) + list(seg.theirs)
+    return ensure_nl(seg.theirs, eol) + list(seg.ours)          # "both-reversed"
+
+
+def _editor_edit(initial: List[str]) -> Optional[List[str]]:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding=ENC, errors=ERR) as f:
+        f.write("".join(initial))
+        name = f.name
+    try:
+        parts = shlex.split(git_out("var", "GIT_EDITOR") or os.environ.get("EDITOR", "vi"))
+        if subprocess.call(parts + [name]) != 0:
+            return None
+        with open(name, encoding=ENC, errors=ERR) as f:
+            return ensure_nl(split_lines(f.read()))
+    finally:
+        os.unlink(name)
+
+
+def choose_interactively(res: Result, c=None) -> Result:
+    """Ask, hunk by hunk, how to resolve what the algorithm could not. Skipped hunks keep their markers."""
+    c = c or _color(sys.stdout.isatty())
+    hard_ix = [i for i, s in enumerate(res.segs) if s.kind == "hard" and s.chosen is None]
+    for n, i in enumerate(hard_ix, 1):
+        seg = res.segs[i]
+        before = res.segs[i - 1].lines[-2:] if i > 0 and res.segs[i - 1].kind != "hard" else []
+        after = res.segs[i + 1].lines[:2] if i + 1 < len(res.segs) and res.segs[i + 1].kind != "hard" else []
+        print("\n{}  conflict {} of {}".format(c("1", res.path), n, len(hard_ix)))
+        if seg.hint:
+            print("  " + seg.hint)
+        def show(tag, ls, col):
+            print("  " + c(col, tag))
+            for l in (ls or ["(nothing: these lines are removed)\n"]):
+                print("    " + l.rstrip("\r\n"))
+
+        for l in before:
+            print("      " + l.rstrip("\r\n"))
+        show("ours   (your side)", seg.ours, "32")
+        show("theirs (other side)", seg.theirs, "36")
+        for l in after:
+            print("      " + l.rstrip("\r\n"))
+        while True:
+            try:
+                a = input("  [o]urs  [t]heirs  [b]oth  [r]everse both  [e]dit  [s]kip  [q]uit > ").strip().lower()
+            except EOFError:
+                a = "q"
+            if a in ("o", "t", "b", "r"):
+                how = {"o": "ours", "t": "theirs", "b": "both", "r": "both-reversed"}[a]
+                seg.chosen = _combine(seg, how, res.eol)
+                seg.choice = "you chose: " + {"ours": "ours", "theirs": "theirs", "both": "both (ours, then theirs)",
+                                              "both-reversed": "both (theirs, then ours)"}[how]
+                break
+            if a == "e":
+                edited = _editor_edit(ensure_nl(seg.ours, res.eol) + list(seg.theirs))
+                if edited is None:
+                    print("  the editor failed; try again")
+                    continue
+                seg.chosen, seg.choice = edited, "you edited it"
+                break
+            if a in ("s", ""):
+                break
+            if a == "q":
+                return build(res, final=True)
+    return build(res, final=True)
 
 
 # ---------------------------------------------------------------- git plumbing
@@ -402,7 +514,7 @@ def resolve_bytes(path: str, base_b: Optional[bytes], ours_b: bytes, theirs_b: b
 def _run(*args: str, check: bool = False, input: Optional[bytes] = None) -> subprocess.CompletedProcess:
     r = subprocess.run(list(args), capture_output=True, input=input)
     if check and r.returncode != 0:
-        raise SystemExit("git smartfix: {} failed: {}".format(" ".join(args[:3]), r.stderr.decode(ENC, ERR).strip()))
+        raise SystemExit("smartfix-mergetool: {} failed: {}".format(" ".join(args[:3]), r.stderr.decode(ENC, ERR).strip()))
     return r
 
 
@@ -415,50 +527,14 @@ def config(key: str, default: str = "") -> str:
     return r.stdout.decode().strip() if r.returncode == 0 else default
 
 
-def unmerged() -> Dict[str, Dict[int, Tuple[str, str]]]:
-    r = _run("git", "ls-files", "-u", "-z")
-    out: Dict[str, Dict[int, Tuple[str, str]]] = {}
-    for entry in r.stdout.split(b"\0"):
-        if not entry:
-            continue
-        meta, path = entry.split(b"\t", 1)
-        mode, sha, stage = meta.split(b" ")
-        out.setdefault(path.decode(ENC, ERR), {})[int(stage)] = (mode.decode(), sha.decode())
-    return out
-
-
-def blob(sha: str) -> bytes:
-    return _run("git", "cat-file", "blob", sha, check=True).stdout
-
-
-def _norm_markers(data: bytes) -> bytes:
-    out = []
-    for line in data.split(b"\n"):
-        if re.match(rb"^(<{7}|\|{7}|>{7})( |\r?$)", line):
-            line = line[:7]
-        out.append(line.rstrip(b"\r"))
-    return b"\n".join(out)
-
-
-def pristine(path: str, base_b: bytes, ours_b: bytes, theirs_b: bytes) -> bool:
-    """True if the working file is still exactly what git wrote (so overwriting loses nothing)."""
-    try:
-        with open(path, "rb") as f:
-            cur = _norm_markers(f.read())
-    except OSError:
-        return True
-    with tempfile.TemporaryDirectory() as d:
-        paths = []
-        for n, data in (("ours", ours_b), ("base", base_b), ("theirs", theirs_b)):
-            p = os.path.join(d, n)
-            with open(p, "wb") as f:
-                f.write(data)
-            paths.append(p)
-        for style in ([], ["--diff3"], ["--zdiff3"]):
-            r = _run("git", "merge-file", "-p", *style, *paths)
-            if r.returncode < 255 and _norm_markers(r.stdout) == cur:
-                return True
-    return False
+def has_ancestor(path: str, base_b: Optional[bytes]) -> bool:
+    """Did the two sides start from a common version of this file?  Ask the index (stage 1); git itself
+    hands the tool an empty BASE file both for an empty ancestor and for "created on both sides"."""
+    r = _run("git", "ls-files", "-u", "-z", "--", ":(literal)" + path)
+    stages = {int(e.split(b"\t")[0].split(b" ")[2]) for e in r.stdout.split(b"\0") if e} if r.returncode == 0 else set()
+    if stages:
+        return 1 in stages
+    return bool(base_b)
 
 
 def last_change(ref: str, path: str) -> str:
@@ -474,30 +550,6 @@ def theirs_ref() -> str:
     return ""
 
 
-def process(path: str, stages: Dict[int, Tuple[str, str]], strict: bool, force: bool) -> Result:
-    res = Result(path)
-    q = shlex.quote(path)
-    if any(m in ("120000", "160000") for m, _ in stages.values()):
-        res.note = "symlink or submodule conflict: choose a side with  git checkout --ours -- {0}  or  --theirs".format(q)
-        return res
-    if 2 not in stages or 3 not in stages:
-        gone = "ours" if 2 not in stages else "theirs"
-        kept = "theirs" if gone == "ours" else "ours"
-        res.note = ("deleted on {} but changed on {}. Keep the file:  git add {}   Remove it:  git rm {}"
-                    .format(gone, kept, q, q))
-        return res
-    base_b = blob(stages[1][1]) if 1 in stages else None
-    ours_b, theirs_b = blob(stages[2][1]), blob(stages[3][1])
-    if any(_is_binary(x) for x in (ours_b, theirs_b, base_b or b"")):
-        return resolve_bytes(path, base_b, ours_b, theirs_b, strict)       # reports "binary file"
-    if not force and not pristine(path, base_b or b"", ours_b, theirs_b):
-        res.status = "skipped"
-        res.note = ("you already edited this file; not touching it. After checking it:  git add {0}   "
-                    "To start over:  git checkout --merge -- {0}  (or rerun with --force)".format(q))
-        return res
-    return resolve_bytes(path, base_b, ours_b, theirs_b, strict)
-
-
 # ---------------------------------------------------------------- report
 
 def _color(on: bool):
@@ -506,12 +558,11 @@ def _color(on: bool):
     return c
 
 
-def print_result(res: Result, c, dry: bool, wrote: bool, ours_ref: str = "", theirs_ref_: str = "") -> None:
-    tag = {"resolved": c("32", "[fixed]  "), "partial": c("33", "[partial]"), "manual": c("31", "[manual] "),
-           "skipped": c("36", "[skipped]")}[res.status]
+def print_result(res: Result, c, ours_ref: str = "", theirs_ref_: str = "") -> None:
+    tag = {"resolved": c("32", "[fixed]  "), "partial": c("33", "[partial]"), "manual": c("31", "[manual] ")}[res.status]
     print("{} {}".format(tag, res.path))
     for ln, level, msg in res.fixes:
-        mark = c("32", "safe  ") if level == SAFE else c("33", "review")
+        mark = c("32", "safe  ") if level == SAFE else c("36", "chosen") if level == "chosen" else c("33", "review")
         print("      {} line {:<5} {}".format(mark, ln, msg))
     for a, b, ours, theirs, hint in res.hards:
         print("      {} lines {}-{}: {}".format(c("31", "manual"), a, b, hint))
@@ -524,67 +575,6 @@ def print_result(res: Result, c, dry: bool, wrote: bool, ours_ref: str = "", the
             print("             last ours   change: " + ours_ref)
         if theirs_ref_:
             print("             last theirs change: " + theirs_ref_)
-
-
-def run(args) -> int:
-    top = git_out("rev-parse", "--show-toplevel")
-    if not top:
-        print("git smartfix: not inside a git repository.", file=sys.stderr)
-        return 2
-    wanted = None
-    if args.files:
-        wanted = {os.path.relpath(os.path.abspath(f), top) for f in args.files}
-    os.chdir(top)
-    files = unmerged()
-    if wanted is not None:
-        files = {p: s for p, s in files.items() if p in wanted}
-        for missing in sorted(wanted - set(files)):
-            print("git smartfix: '{}' has no merge conflict.".format(missing), file=sys.stderr)
-    if not files:
-        print("smartfix: no conflicted files." if wanted is None else "smartfix: nothing to do.")
-        return 0 if wanted is None else 2
-
-    c = _color(sys.stdout.isatty())
-    print("smartfix: {} conflicted file(s){}".format(len(files), "  (dry run: nothing is changed)" if args.dry_run else ""))
-    theirs_name = theirs_ref()
-    results: List[Result] = []
-    for path in sorted(files):
-        res = process(path, files[path], args.strict, args.force)
-        results.append(res)
-        wrote = False
-        if res.data is not None and not args.dry_run:
-            with open(path, "wb") as f:
-                f.write(res.data)
-            wrote = True
-            if res.status == "resolved" and not args.no_add:
-                _run("git", "add", "--", path)
-        ours_info = last_change("HEAD", path) if res.hards else ""
-        theirs_info = last_change(theirs_name, path) if res.hards else ""
-        print_result(res, c, args.dry_run, wrote, ours_info, theirs_info)
-
-    fixed = [r for r in results if r.status == "resolved"]
-    left = [r for r in results if r.status != "resolved"]
-    n_fix = sum(len(r.fixes) for r in results)
-    print("\nsummary: {} file(s) fully fixed, {} need you; {} hunk(s) fixed automatically.".format(
-        len(fixed), len(left), n_fix))
-    if any(l == REVIEW for r in results for _, l, _ in r.fixes):
-        print("         'review' fixes are applied but worth a look:  git diff  (undo a file: git checkout --merge -- FILE)")
-    if fixed and args.no_add and not args.dry_run:
-        print("         staged nothing (--no-add). Stage with:  git add " + " ".join(shlex.quote(r.path) for r in fixed))
-    if left:
-        names = [r.path for r in left if r.status != "skipped"] or [r.path for r in left]
-        cmd = "git mergetool -- " + " ".join(shlex.quote(n) for n in names)
-        print("next:    fix the rest by hand:  " + cmd)
-        if not args.dry_run:
-            go = args.mergetool
-            if not go and not args.no_mergetool and sys.stdin.isatty() and sys.stdout.isatty():
-                go = input("\nOpen git mergetool for the remaining {} file(s) now? [y/N] ".format(len(names))).strip().lower() in ("y", "yes")
-            if go:
-                return subprocess.call(["git", "mergetool", "--"] + names)
-        return 1
-    if not args.dry_run:
-        print("next:    all conflicts are fixed. Finish with:  git commit   (or git merge --continue / git rebase --continue)")
-    return 0
 
 
 # ---------------------------------------------------------------- git mergetool mode
@@ -611,29 +601,58 @@ def as_mergetool(base_p: str, local_p: str, remote_p: str, merged_p: str) -> int
         print("smartfix: LOCAL or REMOTE file is missing.", file=sys.stderr)
         return 1
     strict = config("smartfix.level", "review") == "safe"
-    res = resolve_bytes(merged_p, base_b, ours_b, theirs_b, strict)
+    res = resolve_bytes(merged_p, base_b, ours_b, theirs_b, strict, has_base=has_ancestor(merged_p, base_b))
     print("smartfix: {}".format(merged_p))
     if res.data is not None:
         with open(merged_p, "wb") as f:
             f.write(res.data)
-    print_result(res, c, False, res.data is not None)
+    info = (last_change("HEAD", merged_p), last_change(theirs_ref(), merged_p)) if res.hards else ("", "")
+    print_result(res, c, *info)
     if res.status != "resolved" and not res.hards:
         return 1                       # binary / lock file / nothing an editor can fix
     if res.status == "resolved":
         print("smartfix: fully fixed, no manual work needed.")
         return 0
-    print("smartfix: {} hunk(s) need you.".format(len(res.hards)) if res.hards else "smartfix: needs you.")
-    first = res.hards[0][0] if res.hards else 1
-    fallback(base_p, local_p, remote_p, merged_p, first)
+    # phase 2: the conflicts the algorithm left
+    mode = config("smartfix.interactive", "false" if fallback_command() else "true")
+    tty = sys.stdin.isatty() and sys.stdout.isatty()
+    if mode == "always" or (mode == "true" and tty):
+        choose_interactively(res, c)
+        with open(merged_p, "wb") as f:
+            f.write(res.data)
+        if res.status == "resolved":
+            print("smartfix: all conflicts in {} resolved.".format(merged_p))
+            return 0
+    print("smartfix: {} hunk(s) need you.".format(len(res.hards)))
+    fallback(base_p, local_p, remote_p, merged_p, res.hards[0][0])
     if has_markers(merged_p):
         print("smartfix: conflict markers are still in {}; leaving it unresolved.".format(merged_p), file=sys.stderr)
         return 1
     return 0
 
 
+# Visual tools for the conflicts the algorithm leaves.  $MERGED already holds the automatic fixes.
+FALLBACK_TOOLS = {
+    "vimdiff": 'vim -f -d -c "4wincmd w | wincmd J" "$LOCAL" "$BASE" "$REMOTE" "$MERGED"',
+    "nvimdiff": 'nvim -f -d -c "4wincmd w | wincmd J" "$LOCAL" "$BASE" "$REMOTE" "$MERGED"',
+    "meld": 'meld "$LOCAL" "$MERGED" "$REMOTE" --output "$MERGED"',
+    "code": 'code --wait --merge "$REMOTE" "$LOCAL" "$BASE" "$MERGED"',
+    "vscode": 'code --wait --merge "$REMOTE" "$LOCAL" "$BASE" "$MERGED"',
+    "kdiff3": 'kdiff3 "$BASE" "$LOCAL" "$REMOTE" -o "$MERGED"',
+}
+
+
+def fallback_command() -> str:
+    """Shell command for the manual step, or "" for the plain editor."""
+    cmd = config("smartfix.fallbackCmd")
+    if cmd:
+        return cmd
+    return FALLBACK_TOOLS.get(config("smartfix.fallbackTool").lower(), "")
+
+
 def fallback(base_p: str, local_p: str, remote_p: str, merged_p: str, line: int) -> None:
     env = dict(os.environ, BASE=base_p or "", LOCAL=local_p, REMOTE=remote_p, MERGED=merged_p)
-    cmd = config("smartfix.fallbackCmd")
+    cmd = fallback_command()
     if cmd:
         subprocess.call(cmd, shell=True, env=env)
         return
@@ -645,51 +664,104 @@ def fallback(base_p: str, local_p: str, remote_p: str, merged_p: str, line: int)
     subprocess.call(parts + [merged_p], env=env)
 
 
-def install_tool(scope: str, make_default: bool) -> int:
+TOOL_CMD = 'smartfix-mergetool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'
+
+
+def _apply(scope: str, make_default: bool, tool: str) -> int:
     flag = "--global" if scope == "global" else "--local"
-    cmds = [
-        ["mergetool.smartfix.cmd", 'git smartfix --as-mergetool "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'],
-        ["mergetool.smartfix.trustExitCode", "true"],
-    ]
+    cmds = [["mergetool.smartfix.cmd", TOOL_CMD], ["mergetool.smartfix.trustExitCode", "true"]]
     if make_default:
-        cmds.append(["merge.tool", "smartfix"])
+        cmds += [["merge.tool", "smartfix"], ["mergetool.prompt", "false"]]
+    if tool:
+        if tool.lower() not in FALLBACK_TOOLS and tool.lower() != "editor":
+            print("smartfix-mergetool: unknown tool '{}'. Choose one of: editor, {}".format(
+                tool, ", ".join(sorted(FALLBACK_TOOLS))), file=sys.stderr)
+            return 1
+        cmds.append(["smartfix.fallbackTool", "" if tool.lower() == "editor" else tool.lower()])
     for k, v in cmds:
         r = _run("git", "config", flag, k, v)
         if r.returncode != 0:
-            print("git smartfix: could not set {}: {}".format(k, r.stderr.decode().strip()), file=sys.stderr)
+            print("smartfix-mergetool: could not set {}: {}".format(k, r.stderr.decode().strip()), file=sys.stderr)
             return 1
+    return 0
+
+
+def install_tool(scope: str, make_default: bool, tool: str = "") -> int:
+    if _apply(scope, make_default, tool):
+        return 1
     print("Registered the 'smartfix' merge tool ({}).".format(scope))
-    print("  use it:    git mergetool --tool=smartfix" + ("" if not make_default else "   (or just: git mergetool)"))
-    if not make_default:
-        print("  make default: git config {} merge.tool smartfix".format(flag))
-    print("  hard conflicts open your editor; use another tool instead, for example:")
-    print("    git config {} smartfix.fallbackCmd 'meld \"$LOCAL\" \"$BASE\" \"$REMOTE\" --output \"$MERGED\"'".format(flag))
+    if make_default:
+        print("It is your default merge tool now: just run  git mergetool")
+        print("  (merge.tool = smartfix, mergetool.prompt = false: easy files do not stop and ask)")
+    else:
+        print("  use it:  git mergetool --tool=smartfix")
+        print("  make it the default:  smartfix-mergetool --install --default")
+    if tool:
+        print("Conflicts the algorithm cannot fix open: {}".format(tool))
+    else:
+        print("Conflicts the algorithm cannot fix ask ours/theirs/both/edit, then open your editor.")
+        print("For a visual tool add --fallback ({}).".format(", ".join(sorted(FALLBACK_TOOLS))))
+    print("tip: git config --global mergetool.keepBackup false   (no .orig files left behind)")
+    return 0
+
+
+def auto_install() -> int:
+    """What the installer runs: make `git mergetool` use this tool, changing as little as possible.
+
+    The merge tool you used before (vimdiff, meld, ...) becomes the manual step; settings you made yourself
+    (smartfix.fallbackTool / fallbackCmd, mergetool.keepBackup) are never overwritten."""
+    previous = _run("git", "config", "--global", "--get", "merge.tool").stdout.decode().strip().lower()
+    have_fallback = bool(_run("git", "config", "--global", "--get-regexp", r"^smartfix\.fallback(tool|cmd)$").stdout.strip())
+    tool = "" if have_fallback else (previous if previous in FALLBACK_TOOLS else "editor")
+    if _apply("global", True, tool):
+        return 1
+    if _run("git", "config", "--global", "--get", "mergetool.keepBackup").returncode != 0:
+        _run("git", "config", "--global", "mergetool.keepBackup", "false")
+    manual = _run("git", "config", "--global", "--get", "smartfix.fallbackTool").stdout.decode().strip() or "your editor"
+    print("git mergetool is ready: easy conflicts are fixed by it, the rest opens {}.".format(manual))
+    return 0
+
+
+def migrate() -> int:
+    """Point an old 'git smartfix --as-mergetool' setup at this tool (the git smartfix command is gone)."""
+    changed = 0
+    for flag in ("--global", "--local"):
+        r = _run("git", "config", flag, "--get", "mergetool.smartfix.cmd")
+        if r.returncode == 0 and "git smartfix" in r.stdout.decode():
+            if _run("git", "config", flag, "mergetool.smartfix.cmd", TOOL_CMD).returncode == 0:
+                print("smartfix: updated the {} mergetool setting.".format(flag[2:]))
+                changed += 1
     return 0
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="git smartfix", description=__doc__.split("\n\n")[0],
+    p = argparse.ArgumentParser(prog="smartfix-mergetool", description=__doc__.split("\n\n")[0] + "\n\n" +
+                                "Normally git runs this for you:  git mergetool",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("files", nargs="*", metavar="FILE", help="only these conflicted files (default: all)")
-    p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, change nothing")
-    p.add_argument("--strict", action="store_true", help="apply only the clearly safe fixes")
-    p.add_argument("--force", action="store_true", help="also redo files you already edited by hand")
-    p.add_argument("--no-add", action="store_true", help="do not stage fully fixed files")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--mergetool", action="store_true", help="open git mergetool for what is left, without asking")
-    g.add_argument("--no-mergetool", action="store_true", help="never offer to open git mergetool")
-    p.add_argument("--install-tool", action="store_true", help="register the 'smartfix' tool for git mergetool")
-    p.add_argument("--local", action="store_true", help="with --install-tool: this repository only (default: global)")
-    p.add_argument("--default", action="store_true", help="with --install-tool: also make it merge.tool")
-    p.add_argument("--as-mergetool", nargs=4, metavar=("BASE", "LOCAL", "REMOTE", "MERGED"),
-                   help=argparse.SUPPRESS)
+    p.add_argument("files", nargs="*", metavar="BASE LOCAL REMOTE MERGED",
+                   help="given by git mergetool; do not pass them yourself")
+    p.add_argument("--install", action="store_true", help="register the 'smartfix' tool in git config")
+    p.add_argument("--local", action="store_true", help="with --install: this repository only (default: global)")
+    p.add_argument("--default", action="store_true",
+                   help="with --install: make it your merge.tool and stop git mergetool asking before each file")
+    p.add_argument("--fallback", metavar="TOOL",
+                   help="with --install: the tool for conflicts the algorithm cannot fix "
+                        "(editor, {})".format(", ".join(sorted(FALLBACK_TOOLS))))
+    p.add_argument("--migrate", action="store_true", help="update an old 'git smartfix' mergetool setting")
+    p.add_argument("--auto", action="store_true", help="what the installer runs: make git mergetool use this tool")
     args = p.parse_args(argv)
     try:
-        if args.as_mergetool:
-            return as_mergetool(*args.as_mergetool)
-        if args.install_tool:
-            return install_tool("local" if args.local else "global", args.default)
-        return run(args)
+        if args.install:
+            return install_tool("local" if args.local else "global", args.default, args.fallback or "")
+        if args.migrate:
+            return migrate()
+        if args.auto:
+            return auto_install()
+        if len(args.files) == 4:
+            return as_mergetool(*args.files)
+        p.print_usage(sys.stderr)
+        print("smartfix-mergetool: run it through  git mergetool  (set up once with --install).", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         return 130
 

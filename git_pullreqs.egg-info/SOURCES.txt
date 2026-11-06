@@ -15,11 +15,11 @@ pullreqs/errors.py
 pullreqs/ids.py
 pullreqs/idstore.py
 pullreqs/integration.py
+pullreqs/mergetool.py
 pullreqs/parser.py
 pullreqs/provider.py
 pullreqs/push_master.py
 pullreqs/report.py
-pullreqs/smartfix.py
 pullreqs/staging.py
 tests/test_idstore.py
 tests/test_parser.py

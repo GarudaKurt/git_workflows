@@ -60,59 +60,52 @@ Branch names can be changed: `git config pullreqs.developmentBranch dev`,
 * Writes one self-contained HTML dashboard (default `pullreqs-report.html`): PR counts, each PR's author, branch, latest commit id and message, its stage (ready, picked, in integrations, promoted, wrong target, merged, closed), and the numbered **Drops** list (what `git drop` shows) with a `git drop -N` simulator.
 * Needs `gh` logged in. Open the file in a browser; on WSL the Windows path is printed.
 
-## Merge conflicts: git smartfix
+## Merge conflicts: git mergetool fixes the easy ones
 
-Run it in the middle of a merge, rebase or cherry-pick that stopped on conflicts:
+There is no extra command to run and nothing to set up by hand: `sh install-qa-workflow.sh` registers a merge tool called `smartfix` and makes it the default for `git mergetool`. From then on, whenever a merge, rebase or cherry-pick stops on conflicts, you only run:
 
 ```bash
-git smartfix                 # fix the easy conflicts, stage the files that are fully fixed
-git smartfix --dry-run       # only show what it would do
-git smartfix --strict        # apply only the clearly safe fixes
-git smartfix -i              # for each conflict it cannot decide: pick ours / theirs / both / edit
-git smartfix --prefer ours   # or keep one side (ours, theirs, both) for every remaining conflict
-git mergetool -- FILE        # then fix the hard ones by hand (smartfix prints the exact command)
+git mergetool
 ```
 
-Every conflict is sorted into one of three kinds:
+For each conflicted file it works in two phases:
+
+1. **The algorithm.** The conflicts that have an obvious answer are fixed. If that settles the whole file, `git mergetool` goes straight on to the next file: no window and no question.
+2. **You, by hand, only for what is left.** It prints what each side did and a recommendation, then opens your tool. The file it opens already contains the automatic fixes, and only the conflicts that remain sit between `<<<<<<<` and `>>>>>>>` markers (the original lines are shown after `|||||||`). Fix them, save and quit. If markers are still there, the file stays unresolved and git says so.
+
+What the algorithm decides:
 
 | Kind | What happens | Examples |
 |---|---|---|
 | **safe** | applied | both sides made the same change; only whitespace differs; both added entries to a list (imports, `.gitignore`, `requirements.txt`, bullet points) |
-| **review** | applied and listed, so you can glance at it | edits on neighbouring lines; different words changed on the same line; one side only reformatted; one change already contains the other; both added different code at the same spot (ours first, then theirs) |
-| **manual** | not applied; you get a recommendation and the hunk stays in the file between conflict markers, with the common ancestor shown | both sides changed the same lines differently; one side deleted what the other edited; two numbers that differ (versions, counters); both added similar code; binary files; lock files |
+| **review** | applied and listed in the output, so you can glance at it | edits on neighbouring lines; different words changed on the same line; a comment added next to an edited value; one side only reformatted; one change already contains the other; both added different code at the same spot (ours first, then theirs); both appended to a file with no final newline |
+| **manual** | left for phase 2, with a recommendation | both sides rewrote the same line differently; one side deleted what the other edited; two different numbers (versions, counters); both added similar code; files created separately with no common ancestor; binary files; lock files (the output gives the command that regenerates them) |
 
-* **Two people rewrote the same line** (for example `puts "A"` vs `puts "B"`) is a real conflict: no program can know which wording you want, so it is never decided silently. `git smartfix -i` shows the two versions with a line of context and asks: **o**urs, **t**heirs, **b**oth (ours then theirs), **r**everse both, **e**dit (opens your editor) or **s**kip. Without `-i` it offers this when it finishes (press Enter).
-* The recommendation says what each side did, and for lock files the command that regenerates them (`npm install`, `poetry lock`, ...).
-* Undo one file: `git checkout --merge -- FILE`. A file you already edited by hand is left alone (`--force` redoes it).
-* Fully fixed files are staged (`--no-add` to not). Finish with `git commit`, `git merge --continue` or `git rebase --continue`.
+For phase 2, with no visual tool set, it asks per conflict: **o**urs, **t**heirs, **b**oth (ours then theirs), **r**everse both, **e**dit (your editor), **s**kip. Skipped conflicts go to your editor.
 
-### Using it only through `git mergetool` (recommended)
-
-You do not have to type `git smartfix` at all. Set it up once and from then on `git mergetool` does both phases:
+The tool for phase 2 is your editor, unless you already had a merge tool configured (the installer keeps it, for example `vimdiff` or `meld`). To change it:
 
 ```bash
-git smartfix --install-tool --default --fallback vimdiff     # once (also: meld, code, kdiff3, editor)
-git mergetool                                                # whenever a merge, rebase or cherry-pick stops on conflicts
+git config --global smartfix.fallbackTool vimdiff      # or meld, code, kdiff3, nvimdiff; empty = your editor
 ```
 
-For each conflicted file `git mergetool` now:
-
-1. **Phase 1, the algorithm:** fixes the easy conflicts. If that resolves the whole file it goes straight on to the next file, with no window and no question.
-2. **Phase 2, by hand:** only if some conflict is left, it prints what each side did plus a recommendation, and opens your tool. The file it opens already contains the automatic fixes, and only the remaining conflicts are between `<<<<<<<` and `>>>>>>>` markers (with the original lines shown after `|||||||`). Fix them, save and quit. If the markers are still there, the file stays unresolved.
-
-Settings behind it (all `git config`; add `--local` to `--install-tool` for one repository only):
+Other settings (`git config`, add `--global` for all repositories):
 
 | Setting | Meaning |
 |---|---|
-| `merge.tool = smartfix`, `mergetool.prompt = false` | set by `--default`, so easy files do not stop and ask "Hit return to start" |
-| `smartfix.fallbackTool` | tool for phase 2: `vimdiff`, `nvimdiff`, `meld`, `code`, `kdiff3`, or `editor` (your Git editor, opened at the first conflict) |
+| `smartfix.fallbackTool` | tool for phase 2: `vimdiff`, `nvimdiff`, `meld`, `code`, `kdiff3`; unset = your Git editor, opened at the first conflict |
 | `smartfix.fallbackCmd` | your own command for phase 2, using `$BASE $LOCAL $REMOTE $MERGED`; wins over `fallbackTool` |
 | `smartfix.level = safe` | phase 1 applies only the clearly safe fixes |
 | `smartfix.interactive` | `true` asks ours/theirs/both/edit before phase 2 (the default only when no visual tool is set); `false` never asks |
 
-Tip: `git config --global mergetool.keepBackup false` stops `.orig` files appearing.
+What the installer sets in your global git config: `merge.tool = smartfix`, `mergetool.prompt = false` (easy files do not stop and ask), `mergetool.keepBackup = false` if you had no preference (no `.orig` files), and the `mergetool.smartfix.*` entries that point at the program.
 
-Without `--default` use `git mergetool --tool=smartfix`.
+Notes:
+* To use another tool for one run: `git mergetool --tool=meld`.
+* If you quit phase 2 without fixing a file, git puts the original conflicted file back; run `git mergetool` again whenever you like. Undo a finished file: `git checkout --merge -- FILE`.
+* Review the "review" fixes with `git diff` before you commit.
+* An older version had a `git smartfix` command. It is gone; the installer converts its mergetool setting automatically.
+* `smartfix-mergetool` is the program `git mergetool` launches. You never run it yourself.
 
 ## Good to know
 * A conflict while picking stops with the PR named. Fix and `git commit --no-edit`, or `git merge --abort`.
