@@ -53,6 +53,15 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return r
 
 
+def goto_toplevel() -> None:
+    """Work from the repository root.  Git prints paths relative to the root but resolves pathspecs relative to the
+    current directory, so running from a sub-folder would make every conflicted path look missing."""
+    import os
+    r = git("rev-parse", "--show-toplevel", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        os.chdir(r.stdout.strip())
+
+
 def config(key: str, default: str) -> str:
     r = git("config", "--get", key, check=False)
     value = r.stdout.strip()
@@ -204,6 +213,8 @@ cat > pullreqs/drop.py <<'PM_EOF_DROP'
     git drop -3           drop the FIRST 3 PRs of that list (positions 1-3)
     git drop -3 --dry-run show what would happen
     git drop --all        list: also show PRs already promoted to main
+    git drop --files      list: also show the files each PR changed
+    git drop -1 --save DIR   keep the copy of the dropped PR(s) in DIR (default: inside .git)
 
 The number in `git drop -N` is a POSITION in the displayed list, not a PR ID:
 `git drop -3` removes positions 1, 2 and 3 whatever their PR numbers are.
@@ -213,17 +224,24 @@ merged again, in the same order and at the exact commit that was tested.  The
 original pull requests and their commits stay untouched on development.  Nothing is
 brought back automatically; re-pick what you want with: git pullreqs -p <PR ID>
 
+Before anything is rewritten, a COPY of what you are dropping is saved (see --save):
+for every dropped PR the list of files, a patch (PR-<n>.patch) and the files themselves
+as they were in that PR (files/PR-<n>/...).  Default place: <repo>/.git/pullreqs-dropped/
+<date-time>/ .   git drop --files lists the files of every picked PR without dropping.
+
 If origin/integrations holds the dropped PRs it is updated too, with
 --force-with-lease (it refuses if somebody else pushed in the meantime), so your next
 plain `git push` keeps working.  Use --no-push to leave origin alone.
 """
 import argparse
+import datetime
+import os
 import re
 import sys
-from typing import List
+from typing import List, Optional, Tuple
 
-from .integration import ensure_clean_worktree, ensure_integrations_branch
-from .staging import (StagingError, fetch, git, integrated_merges, integrations_branch, is_ancestor,
+from .integration import ensure_clean_worktree, ensure_integrations_branch, merge_pr
+from .staging import (StagingError, goto_toplevel, fetch, git, integrated_merges, integrations_branch, is_ancestor,
                       pr_title, remote_name, remote_ref, rev, target_branch, target_ref, working_ref)
 
 
@@ -233,6 +251,82 @@ def _warn_remote_only(remote, remote_only) -> None:
               "  you dropped them  ->  git push --force-with-lease\n"
               "  someone pushed them  ->  git pull --ff-only"
               .format(remote, ", ".join("#%d" % n for n in remote_only)))
+
+
+def pr_files(merge_sha: str) -> List[Tuple[str, str]]:
+    """Files a picked PR brought into integrations: [(status, path)], status A/M/D/R/T (R shows 'old -> new')."""
+    out = git("diff", "--name-status", "-z", "-M", merge_sha + "^1", merge_sha).stdout.split("\0")
+    files, i = [], 0
+    while i < len(out) and out[i]:
+        st = out[i][0]
+        if st in "RC":
+            files.append(("R" if st == "R" else "A", "{} -> {}".format(out[i + 1], out[i + 2]) if st == "R" else out[i + 2]))
+            i += 3
+        else:
+            files.append((st, out[i + 1]))
+            i += 2
+    return files
+
+
+def _final_path(path: str) -> str:
+    return path.split(" -> ")[-1]
+
+
+def _cat(sha: str, path: str) -> Optional[bytes]:
+    """Content of path at commit sha as bytes; None for submodules or anything that is not a file."""
+    import subprocess
+    r = subprocess.run(["git", "cat-file", "blob", "{}:{}".format(sha, path)], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def save_copy(dropped, dest_root: Optional[str], titles: bool) -> str:
+    """Write the copy of the PRs about to be dropped. Returns the folder. Raises StagingError if it cannot."""
+    if dest_root is None:
+        gitdir = git("rev-parse", "--absolute-git-dir").stdout.strip()
+        dest_root = os.path.join(gitdir, "pullreqs-dropped")
+    dest_root = os.path.abspath(os.path.expanduser(dest_root))
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(dest_root, "dropped-" + stamp)
+    n = 1
+    while os.path.exists(folder):                 # two drops in the same second
+        n += 1
+        folder = os.path.join(dest_root, "dropped-{}-{}".format(stamp, n))
+    try:
+        os.makedirs(folder)
+        lines = ["Dropped from {} on {}".format(integrations_branch(), datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")), ""]
+        for pos, (number, sha, short) in enumerate(dropped, 1):
+            title = (pr_title(number) or "") if titles else ""
+            tested = rev(sha + "^2")[:10]
+            files = pr_files(sha)
+            lines.append("{}. PR #{}  tested commit {}  merge {}  {}".format(pos, number, tested, sha[:10], title).rstrip())
+            lines += ["     {}  {}".format(st, p) for st, p in files] or ["     (no file changes)"]
+            lines.append("")
+            patch = git("diff", "--binary", "-M", sha + "^1", sha).stdout
+            with open(os.path.join(folder, "PR-{}.patch".format(number)), "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(patch)
+            for st, p in files:
+                if st == "D":
+                    continue
+                path = _final_path(p)
+                parts = path.replace("\\", "/").split("/")
+                if path.startswith("/") or ".." in parts:
+                    continue                                        # never write outside the folder
+                data = _cat(sha, path)
+                if data is None:
+                    continue
+                target = os.path.join(folder, "files", "PR-{}".format(number), *parts)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as f:
+                    f.write(data)
+        lines.append("Restore: git pullreqs -p <PR number>   (the original PRs are untouched)")
+        lines.append("A patch is in PR-<n>.patch (git apply it on the state before the PR); files/ holds each file as the PR left it.")
+        with open(os.path.join(folder, "summary.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        raise StagingError("could not save a copy of the dropped PR(s) to {}: {}\n"
+                           "Nothing was changed. Choose another place with --save DIR, or skip it with --no-save."
+                           .format(folder, e.strerror or e))
+    return folder
 
 
 def list_prs(args) -> int:
@@ -267,7 +361,7 @@ def list_prs(args) -> int:
 
     titles_ok = not args.no_titles
     position = 0
-    for number, _, short in rows:
+    for number, sha, short in rows:
         if number in pending:
             position += 1
             label = "{:>3}.".format(position)
@@ -282,6 +376,9 @@ def list_prs(args) -> int:
             else:
                 title = "  " + found
         print("{} PR #{:<8} Commit: {}{}   [{}]".format(label, number, short, title, status))
+        if args.files:
+            for st, p in pr_files(sha):
+                print("          {}  {}".format(st, p))
 
     print("\nTotal: {} pull request(s) in the trial integration".format(position))
     if position:
@@ -296,6 +393,7 @@ def list_prs(args) -> int:
 
 def drop_first(args, count: int) -> int:
     name, target, remote = integrations_branch(), target_branch(), remote_name()
+    goto_toplevel()
     ensure_clean_worktree()
     ensure_integrations_branch(create=False)           # fetches, switches, fast-forwards if behind
 
@@ -324,6 +422,10 @@ def drop_first(args, count: int) -> int:
     print("Trial integration has {} PR(s). Dropping the first {}:".format(len(merges), count))
     print("  Drop : {}".format(fmt(dropped, 1)))
     print("  Keep : {}   (positions after the drop: 1..{})".format(fmt(kept, count + 1), len(kept)))
+    print("  Files in the dropped PR(s):")
+    for number, sha, _ in dropped:
+        for st, p in pr_files(sha) or [("-", "(no file changes)")]:
+            print("    #{:<6} {}  {}".format(number, st, p))
 
     old_tip, published = rev(name), remote_ref(name)
     published_sha = rev(published) if published else None
@@ -336,20 +438,28 @@ def drop_first(args, count: int) -> int:
     if not args.yes:
         if not sys.stdin.isatty():
             raise StagingError("Not a terminal: add --yes to confirm.")
-        if input("\nRewrite {} without these PRs? [y/N] ".format(name)).strip().lower() not in ("y", "yes"):
+        # asked on stderr, so `git drop -1 > report.txt` still shows the question
+        sys.stderr.write("Rewrite {} without {}? [y/N] ".format(name, ", ".join("#%d" % n for n, _, _ in dropped)))
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
             print("Aborted. Nothing was changed.")
             return 1
+    if not args.no_save:
+        folder = save_copy(dropped, args.save, titles=not args.no_titles)
+        print("\nSaved a copy of the dropped PR(s): {}".format(folder))
+        print("  summary.txt (files per PR), PR-<n>.patch, files/PR-<n>/<the files as the PR left them>")
 
     git("switch", "--detach", base)                     # rebuild off to the side; branch untouched until done
     try:
         for number, sha, _ in kept:
-            r = git("merge", "--no-ff", "-m", "Integrate PR #{}".format(number), sha + "^2", check=False)
-            if r.returncode != 0:
-                git("merge", "--abort", check=False)
+            o = merge_pr(number, sha + "^2")
+            if not o.ok:
+                why = "; ".join("{} ({})".format(f, o.reasons.get(f, "conflict")) for f in o.files) or o.detail
                 raise StagingError(
-                    "PR #{} no longer merges cleanly without the dropped PR(s):\n{}\n"
-                    "Nothing was changed ({} is as before). Drop more PRs (a bigger N), or resolve it by hand."
-                    .format(number, (r.stdout + r.stderr).strip(), name))
+                    "FAILURE: PR #{} no longer merges cleanly without the dropped PR(s): {}\n"
+                    "The merge was aborted ({}) and nothing was changed ({} is as before). "
+                    "Drop more PRs (a bigger N), or resolve PR #{} by hand."
+                    .format(number, why, o.abort or "git merge --abort", name, number))
         new_tip = rev("HEAD")
     except StagingError:
         git("switch", name)
@@ -381,6 +491,10 @@ def main(argv: List[str] = None) -> int:
     p.add_argument("--all", action="store_true", help="list: also show PRs already in the target branch")
     p.add_argument("--no-fetch", action="store_true", help="list: do not fetch the remote first")
     p.add_argument("--no-titles", action="store_true", help="list: skip the PR title lookup (gh)")
+    p.add_argument("--files", action="store_true", help="list: also show the files each PR changed")
+    p.add_argument("--save", metavar="DIR", help="drop: where to keep the copy of the dropped PR(s) "
+                                                  "(default: <repo>/.git/pullreqs-dropped)")
+    p.add_argument("--no-save", action="store_true", help="drop: do not keep a copy")
     p.add_argument("--dry-run", action="store_true", help="drop: show the plan only")
     p.add_argument("-y", "--yes", action="store_true", help="drop: do not ask for confirmation")
     p.add_argument("--no-push", action="store_true", help="drop: do not update origin/integrations")
@@ -661,10 +775,12 @@ The branch is created from origin/development the first time, or from
 origin/integrations if QA already pushed it.  It is set up to track
 origin/integrations, so a plain `git push` publishes it.
 """
+import json
 import sys
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-from .staging import (StagingError, development_branch, git, gh_available, integrated_prs,
+from .staging import (StagingError, goto_toplevel, integrated_merges, development_branch, git, gh_available, integrated_prs,
                       integrations_branch, is_ancestor, local_branch_exists, pr_info, ref_exists,
                       remote_name, remote_ref, rev, working_ref)
 
@@ -736,47 +852,234 @@ def check_prs(numbers: List[int]) -> None:
                                .format(number, info.get("baseRefName"), dev, dev))
 
 
-def integrate(numbers: List[int]) -> Tuple[List[int], List[int]]:
-    """Merge each PR into the integrations branch. Returns (merged, skipped)."""
+EXIT_OK, EXIT_ERROR, EXIT_CONFLICT = 0, 1, 2     # 2 = some PR could not be integrated (the others were)
+
+
+@dataclass
+class PrOutcome:
+    """What happened to one PR.  status: merged | resolved | skipped | failed | error | not_attempted"""
+    number: int
+    status: str
+    files: List[str] = field(default_factory=list)          # auto-resolved files, or the files that failed
+    reasons: Dict[str, str] = field(default_factory=dict)   # failed file -> why
+    culprits: Dict[str, List[int]] = field(default_factory=dict)  # failed file -> earlier picked PRs touching it
+    detail: str = ""
+    abort: str = ""                                          # the abort command that was run
+    pending: bool = False                                    # --leave-conflicts: the merge was left in progress
+
+    @property
+    def ok(self) -> bool:
+        return self.status in ("merged", "resolved", "skipped")
+
+
+@dataclass
+class Report:
+    branch: str
+    outcomes: List[PrOutcome] = field(default_factory=list)
+
+    def by(self, *statuses: str) -> List[PrOutcome]:
+        return [o for o in self.outcomes if o.status in statuses]
+
+    @property
+    def merged(self) -> List[int]:
+        return [o.number for o in self.by("merged", "resolved")]
+
+    @property
+    def skipped(self) -> List[int]:
+        return [o.number for o in self.by("skipped")]
+
+    @property
+    def failed(self) -> List[PrOutcome]:
+        return self.by("failed", "error")
+
+    @property
+    def exit_code(self) -> int:
+        if any(o.status == "error" for o in self.outcomes):
+            return EXIT_ERROR
+        return EXIT_CONFLICT if self.failed else EXIT_OK
+
+    def to_dict(self) -> dict:
+        return {"branch": self.branch, "exit_code": self.exit_code, "ok": not self.failed,
+                "failed_prs": [o.number for o in self.failed],
+                "prs": [{"pr": o.number, "status": o.status, "files": o.files, "reasons": o.reasons,
+                         "also_touched_by": {f: v for f, v in o.culprits.items()},
+                         "abort_command": o.abort, "left_in_progress": o.pending, "detail": o.detail} for o in self.outcomes]}
+
+
+def _touching(path: str, exclude: int) -> List[int]:
+    """Earlier picked PRs (integrations, not yet in main) whose merge changed `path`."""
+    from .staging import target_ref
+    tref = target_ref()
+    hits = []
+    try:
+        for n, sha, _ in integrated_merges("HEAD", not_in=tref) if tref else integrated_merges("HEAD"):
+            if n != exclude and git("diff", "--name-only", sha + "^1", sha, "--", path, check=False).stdout.strip():
+                hits.append(n)
+    except StagingError:
+        pass
+    return hits
+
+
+def merge_pr(number: int, ref: str, auto: bool = True, leave: bool = False) -> PrOutcome:
+    """Merge `ref` into HEAD as 'Integrate PR #N'.  Conflicts go to the automatic algorithm; if it cannot fix
+    all of them the merge is aborted (git merge --abort, or git cherry-pick --abort when that is what is in
+    progress) and the repository is back exactly where it was.  Never leaves a half-done merge behind,
+    unless `leave` is set: then the merge stays in progress (what the algorithm could fix is already staged)
+    so that a person can finish it with `git mergetool` and `git commit`."""
+    from . import mergetool as mt
+    before = rev("HEAD")
+    msg = "Integrate PR #{}".format(number)
+    r = git("merge", "--no-ff", "-m", msg, ref, check=False)
+    if r.returncode == 0:
+        return PrOutcome(number, "merged")
+    out = PrOutcome(number, "failed")
+    if not mt.operation():                                   # git refused before starting (e.g. untracked file in the way)
+        out.status, out.detail = "error", (r.stderr or r.stdout).strip()
+        return out
+    unmerged = mt.unmerged_paths()
+    out.files = list(unmerged)
+    if auto:
+        fixed, failed = mt.resolve_index()
+        if not failed and not mt.unmerged_paths():
+            body = "{}\n\nConflicts resolved automatically (smartfix):\n{}\n".format(msg, "\n".join("  " + f for f in fixed))
+            import subprocess
+            c = subprocess.run(["git", "commit", "-q", "-F", "-"], input=body, text=True, capture_output=True)
+            if c.returncode == 0 and not mt.operation():
+                out.status, out.files = "resolved", fixed
+                return out
+            failed = [(f, "git commit failed: " + (c.stderr or c.stdout).strip()) for f in (fixed or ["?"])][:1]
+        out.reasons = dict(failed)
+        out.files = [f for f, _ in failed]
+    else:
+        out.reasons = {f: "automatic resolution is switched off" for f in unmerged}
+    if leave:
+        out.pending = True
+        return out
+    ok, cmd, detail = mt.abort_operation()
+    out.abort = cmd
+    if not ok or rev("HEAD") != before or git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        out.status = "error"
+        out.detail = "could not abort cleanly ({}): {}".format(cmd, detail)
+        return out
+    out.culprits = {f: _touching(f, number) for f in out.files}
+    return out
+
+
+def _print_outcome(o: PrOutcome, branch: str) -> None:
+    if o.status == "merged":
+        print("  PR #{}: merged".format(o.number))
+    elif o.status == "resolved":
+        print("  PR #{}: merged, {} conflicting file(s) fixed automatically: {}".format(o.number, len(o.files), ", ".join(o.files)))
+    elif o.status == "failed":
+        print("  PR #{}: FAILED, conflicts the algorithm cannot resolve:".format(o.number))
+        for f in o.files:
+            print("      {}  ({})".format(f, o.reasons.get(f, "conflict")))
+            if o.culprits.get(f):
+                print("        also changed by picked PR(s): {}".format(", ".join("#%d" % n for n in o.culprits[f])))
+        if o.pending:
+            print("      merge LEFT IN PROGRESS for you: git mergetool, then git commit (or git merge --abort)")
+        else:
+            print("      ran '{}': {} is unchanged".format(o.abort, branch))
+    elif o.status == "error":
+        print("  PR #{}: ERROR {}".format(o.number, o.detail))
+
+
+def print_report(rep: Report) -> None:
+    print("\nIntegration summary for {}:".format(rep.branch))
+    for o in rep.outcomes:
+        if o.status == "skipped":
+            print("  PR #{}: already there".format(o.number))
+        elif o.status == "not_attempted":
+            print("  PR #{}: not attempted (stopped after the first failure)".format(o.number))
+        else:
+            _print_outcome(o, rep.branch)
+    if rep.failed:
+        nums = ", ".join("#%d" % o.number for o in rep.failed)
+        print("\nResult: FAILURE - needs manual intervention: PR {}".format(nums))
+        print("        Merged anyway: {}".format(", ".join("#%d" % n for n in rep.merged) or "none"))
+    else:
+        print("\nResult: SUCCESS - {} PR(s) integrated".format(len(rep.merged)))
+
+
+def _ask_continue(failed: int, remaining: List[int]) -> str:
+    """Ask at a terminal whether to go on.  Returns 'yes', 'no' or 'all' (do not ask again).
+    Enter = yes, which is the default behaviour.  Without a terminal nothing is asked."""
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return "yes"
+    nums = ", ".join("#%d" % n for n in remaining)
+    while True:
+        sys.stderr.write("\nPR #{} failed and was aborted. Continue with the remaining PR(s) {}? "
+                         "[Y]es / [n]o, stop here / [a]lways continue: ".format(failed, nums))
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        if not line:                                  # input closed: keep the default
+            return "yes"
+        ans = line.strip().lower()
+        if ans in ("", "y", "yes"):
+            return "yes"
+        if ans in ("n", "no", "s", "stop"):
+            return "no"
+        if ans in ("a", "all", "always"):
+            return "all"
+
+
+def integrate(numbers: List[int], auto: bool = True, stop_on_conflict: bool = False,
+              status_file: Optional[str] = None, ask: bool = True, leave_conflicts: bool = False) -> Report:
+    """Merge each PR into the integrations branch.  A PR whose conflicts cannot be fixed automatically is
+    aborted and reported; the remaining PRs are still tried (unless stop_on_conflict).  At a terminal, with
+    `ask`, the user is asked after each failure whether to go on (Enter = go on).  Returns a Report."""
     if not numbers:
         raise StagingError("No pull request numbers given.")
+    goto_toplevel()
     ensure_clean_worktree()
     current = working_ref()
     already = dict(integrated_prs(current)) if current else {}
     check_prs([n for n in numbers if n not in already])
 
     name, remote = ensure_integrations_branch(), remote_name()
-    merged, skipped = [], []
-    for number in numbers:
+    rep = Report(name)
+    stop = False
+    for idx, number in enumerate(numbers):
+        if stop:
+            rep.outcomes.append(PrOutcome(number, "not_attempted"))
+            continue
         if number in dict(integrated_prs(name)):
             print("PR #{} is already picked. Skipping.".format(number))
-            skipped.append(number)
+            rep.outcomes.append(PrOutcome(number, "skipped"))
             continue
 
         print("Fetching PR #{} ...".format(number))
         r = git("fetch", remote, "refs/pull/{}/head".format(number), check=False)
         if r.returncode != 0:
-            raise StagingError("Could not fetch PR #{}: {}\nIs the number right? "
-                               "Check with: git pullreqs --oneline".format(number, r.stderr.strip()))
+            rep.outcomes.append(PrOutcome(number, "error", detail="could not fetch: {}. Is the number right? "
+                                          "Check with: git pullreqs --oneline".format(r.stderr.strip())))
+            stop = stop_on_conflict
+            continue
         if is_ancestor("FETCH_HEAD", "HEAD"):
             print("PR #{} is already contained in {} (for example it was merged earlier). "
                   "Nothing to merge.".format(number, name))
-            skipped.append(number)
+            rep.outcomes.append(PrOutcome(number, "skipped"))
             continue
 
         print("Merging PR #{} into {} ...".format(number, name))
-        r = git("merge", "--no-ff", "-m", "Integrate PR #{}".format(number), "FETCH_HEAD", check=False)
-        if r.returncode != 0:
-            rest = numbers[numbers.index(number) + 1:]
-            raise StagingError(
-                "Merge of PR #{} into {} stopped:\n{}\n"
-                "Fix the conflicts and run 'git commit --no-edit', or run 'git merge --abort'.\n"
-                "Picked before it: {}. Not picked yet: {}."
-                .format(number, name, (r.stdout + r.stderr).strip(),
-                        ", ".join("#%d" % n for n in merged) or "none",
-                        ", ".join("#%d" % n for n in rest) or "none"))
-        merged.append(number)
-    return merged, skipped
+        o = merge_pr(number, "FETCH_HEAD", auto, leave_conflicts)
+        rep.outcomes.append(o)
+        if not o.ok:
+            print("PR #{} FAILED: {}".format(number, "; ".join("%s (%s)" % (f, o.reasons.get(f, "conflict")) for f in o.files) or o.detail))
+            if o.status == "error" or stop_on_conflict or o.pending:
+                stop = True
+            elif ask and numbers[idx + 1:]:
+                answer = _ask_continue(number, numbers[idx + 1:])
+                if answer == "no":
+                    stop = True
+                elif answer == "all":
+                    ask = False
+    print_report(rep)
+    if status_file:
+        with open(status_file, "w") as f:
+            json.dump(rep.to_dict(), f, indent=2)
+        print("Status written to {}".format(status_file))
+    return rep
 
 
 def main(argv=None) -> int:
@@ -785,11 +1088,10 @@ def main(argv=None) -> int:
         print("Usage: python -m pullreqs.integration <PR_NUMBER> [PR_NUMBER ...]", file=sys.stderr)
         return 1
     try:
-        integrate([int(a) for a in argv])
+        return integrate([int(a) for a in argv]).exit_code
     except StagingError as error:
         print("Error: {}".format(error), file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
@@ -1911,6 +2213,133 @@ def as_mergetool(base_p: str, local_p: str, remote_p: str, merged_p: str) -> int
     return 0
 
 
+
+# ---------------------------------------------------------------- batch mode (no files, no prompts)
+# Used by `git pullreqs -p`, `git drop` and `smartfix-mergetool --resolve-or-abort`:
+# fix every unmerged path with the same algorithm, or leave the repository exactly as it was.
+
+OPERATIONS = (("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"))
+
+
+def git_dir() -> str:
+    return git_out("rev-parse", "--absolute-git-dir")
+
+
+def operation() -> str:
+    """'merge', 'cherry-pick', 'revert', 'rebase' or '' (nothing in progress)."""
+    for ref, name in OPERATIONS:
+        if _run("git", "rev-parse", "-q", "--verify", ref).returncode == 0:
+            return name
+    gd = git_dir()
+    if os.path.isdir(os.path.join(gd, "rebase-merge")) or os.path.isdir(os.path.join(gd, "rebase-apply")):
+        return "rebase"
+    return ""
+
+
+def abort_operation() -> Tuple[bool, str, str]:
+    """Cancel whatever is in progress with its own abort command (git cherry-pick --abort, git merge --abort,
+    ...).  Returns (ok, command_run, detail).  ok means: nothing is in progress any more."""
+    op = operation()
+    if not op:
+        return True, "", "nothing was in progress"
+    cmd = ["git", op, "--abort"]
+    r = _run(*cmd)
+    still = operation()
+    detail = (r.stderr or r.stdout).decode(ENC, ERR).strip()
+    return (r.returncode == 0 and not still), " ".join(cmd), detail
+
+
+def unmerged_paths() -> List[str]:
+    r = _run("git", "diff", "--name-only", "--diff-filter=U", "-z")
+    return [x.decode(ENC, ERR) for x in r.stdout.split(b"\0") if x]
+
+
+def _stages(path: str) -> dict:
+    """{stage: (mode, sha)} of an unmerged path, from the index."""
+    r = _run("git", "ls-files", "-u", "-z", "--", ":(literal)" + path)
+    out = {}
+    for e in r.stdout.split(b"\0"):
+        if e:
+            meta, _, _ = e.partition(b"\t")
+            mode, sha, stage = meta.decode().split(" ")
+            out[int(stage)] = (mode, sha)
+    return out
+
+
+def _blob(sha: str) -> bytes:
+    return _run("git", "cat-file", "blob", sha).stdout
+
+
+def resolve_index(strict: Optional[bool] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Run the algorithm over every unmerged path of the current merge/cherry-pick/...  Fully fixed files are
+    written and `git add`ed.  Returns (resolved_paths, [(path, why_not)]).  Files with hunks left are not touched."""
+    if strict is None:
+        strict = config("smartfix.level", "review") == "safe"
+    top = git_out("rev-parse", "--show-toplevel")
+    if top:
+        os.chdir(top)                  # unmerged paths are root-relative; git resolves pathspecs from the cwd
+    fixed, failed = [], []
+    for path in unmerged_paths():
+        st = _stages(path)
+        if 2 not in st or 3 not in st:
+            failed.append((path, "deleted on one side and changed on the other"))
+            continue
+        if any(st[k][0] in ("120000", "160000") for k in st):
+            failed.append((path, "symlink or submodule: choose a side by hand"))
+            continue
+        res = resolve_bytes(path, _blob(st[1][1]) if 1 in st else None, _blob(st[2][1]), _blob(st[3][1]),
+                            strict, has_base=1 in st)
+        if res.status == "resolved" and res.data is not None:
+            try:
+                with open(path, "wb") as f:
+                    f.write(res.data)
+            except OSError as e:
+                failed.append((path, "cannot write: {}".format(e)))
+                continue
+            if _run("git", "add", "--", path).returncode != 0:
+                failed.append((path, "git add failed"))
+                continue
+            fixed.append(path)
+        else:
+            why = res.note or "{} hunk(s) need a human decision".format(len(res.hards) or 1)
+            failed.append((path, why))
+    return fixed, failed
+
+
+def resolve_or_abort(pr: Optional[int] = None) -> int:
+    """Finish the operation in progress if the algorithm can fix every conflict, else abort it cleanly.
+    Exit status: 0 resolved and continued, 1 conflicts left, operation aborted, 2 could not (nothing in
+    progress, or the abort itself failed)."""
+    label = "PR #{}".format(pr) if pr is not None else "this change"
+    top = git_out("rev-parse", "--show-toplevel")
+    if top:
+        os.chdir(top)
+    op = operation()
+    if not op:
+        print("smartfix: FAILURE: no merge, cherry-pick, revert or rebase is in progress.", file=sys.stderr)
+        return 2
+    before = unmerged_paths()
+    fixed, failed = resolve_index()
+    if not failed and not unmerged_paths():
+        env = dict(os.environ, GIT_EDITOR="true")
+        r = subprocess.run(["git", op, "--continue"], capture_output=True, env=env)
+        if r.returncode == 0 and not operation():
+            print("smartfix: SUCCESS: {} conflict(s) in {} resolved automatically: {}"
+                  .format(len(fixed), label, ", ".join(fixed) or "-"))
+            return 0
+        failed = [("(continue)", (r.stderr or r.stdout).decode(ENC, ERR).strip() or "git {} --continue failed".format(op))]
+    ok, cmd, detail = abort_operation()
+    print("smartfix: FAILURE: {} needs manual intervention.".format(label), file=sys.stderr)
+    for path, why in failed:
+        print("  {}: {}".format(path, why), file=sys.stderr)
+    if ok:
+        print("smartfix: ran '{}'; the working tree is back to its state before {}.".format(cmd, label), file=sys.stderr)
+        return 1
+    print("smartfix: '{}' FAILED: {}\nsmartfix: the repository is still mid-{}; finish or abort it by hand."
+          .format(cmd, detail, op), file=sys.stderr)
+    return 2
+
+
 # Visual tools for the conflicts the algorithm leaves.  $MERGED already holds the automatic fixes.
 FALLBACK_TOOLS = {
     "vimdiff": 'vim -f -d -c "4wincmd w | wincmd J" "$LOCAL" "$BASE" "$REMOTE" "$MERGED"',
@@ -2029,8 +2458,14 @@ def main(argv=None) -> int:
                         "(editor, {})".format(", ".join(sorted(FALLBACK_TOOLS))))
     p.add_argument("--migrate", action="store_true", help="update an old 'git smartfix' mergetool setting")
     p.add_argument("--auto", action="store_true", help="what the installer runs: make git mergetool use this tool")
+    p.add_argument("--resolve-or-abort", action="store_true",
+                   help="for scripts: fix every conflict of the merge/cherry-pick in progress with the algorithm "
+                        "and continue it, or abort it cleanly. Exit 0 resolved, 1 aborted, 2 could not abort")
+    p.add_argument("--pr", type=int, metavar="N", help="with --resolve-or-abort: the PR number to name in the report")
     args = p.parse_args(argv)
     try:
+        if args.resolve_or_abort:
+            return resolve_or_abort(args.pr)
         if args.install:
             return install_tool("local" if args.local else "global", args.default, args.fallback or "")
         if args.migrate:
@@ -2160,6 +2595,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "(extra args after `--` go to `gh pr create`)")
     g.add_argument("--report", action="store_true",
                    help="write an HTML dashboard: PR counts, authors, latest commits and the drop list")
+    p.add_argument("--no-auto-resolve", action="store_true",
+                   help="with -p: do not try the automatic conflict algorithm; abort a conflicting PR at once")
+    p.add_argument("--stop-on-conflict", action="store_true",
+                   help="with -p: stop at the first PR that fails, without asking")
+    p.add_argument("--continue-on-conflict", action="store_true",
+                   help="with -p: carry on with the other PRs after a failure, without asking "
+                        "(default at a terminal: ask; without a terminal: carry on)")
+    p.add_argument("--leave-conflicts", action="store_true",
+                   help="with -p: when the algorithm cannot fix a PR, leave the merge in progress (what it could "
+                        "fix is staged) for git mergetool / git commit, instead of aborting. Stops there")
+    p.add_argument("--status-file", metavar="FILE", help="with -p: also write the per-PR result as JSON")
     p.add_argument("-o", "--output", default="pullreqs-report.html", metavar="FILE",
                    help="with --report: the file to write (default: pullreqs-report.html)")
     p.add_argument("-t", "--title", metavar="TITLE", help="with --create: the PR title (default: from your commits)")
@@ -2206,7 +2652,7 @@ def cmd_oneline(provider, store):
               f"[{pr.author}] {pr.title}{suffix}")
 
 
-def cmd_pick(tokens: List[str]):
+def cmd_pick(tokens: List[str], args=None) -> int:
     """Pick PRs: merge each one into the local integrations branch, for testing."""
     def all_open() -> List[int]:
         return [int(p.native_id) for p in ShellProvider(load_config()).list()]
@@ -2214,8 +2660,12 @@ def cmd_pick(tokens: List[str]):
     numbers = parse_numbers(tokens, all_open)
     if not numbers:
         raise PullreqsError("No pull request numbers given.")
-    merged, skipped = integrate(numbers)
-    name = integrations_branch()
+    rep = integrate(numbers, auto=not (args and args.no_auto_resolve),
+                    stop_on_conflict=bool(args and args.stop_on_conflict),
+                    ask=not (args and args.continue_on_conflict),
+                    leave_conflicts=bool(args and args.leave_conflicts),
+                    status_file=args.status_file if args else None)
+    merged, skipped, name = rep.merged, rep.skipped, integrations_branch()
     print("\nPicked into {}: {}".format(name, ", ".join("#%d" % n for n in merged) or "nothing new"))
     if skipped:
         print("Already there : {}".format(", ".join("#%d" % n for n in skipped)))
@@ -2223,6 +2673,7 @@ def cmd_pick(tokens: List[str]):
     print("  git push                         publish the validated picks to origin/{}".format(name))
     print("  git drop                         numbered list of what is picked")
     print("  git drop -N                      drop the first N of that list")
+    return rep.exit_code
 
 
 def cmd_report(output: str):
@@ -2260,8 +2711,7 @@ def main(argv=None) -> int:
         if extra and not args.create:
             raise PullreqsError(f"unrecognized arguments: {' '.join(extra)}")
         if args.pick is not None:
-            cmd_pick(args.pick)
-            return 0
+            return cmd_pick(args.pick, args)
         if args.report:
             cmd_report(args.output)
             return 0
@@ -2393,8 +2843,35 @@ Notes:
 * An older version had a `git smartfix` command. It is gone; the installer converts its mergetool setting automatically.
 * `smartfix-mergetool` is the program `git mergetool` launches. You never run it yourself.
 
+## Conflicts while picking: `git pullreqs -p`
+
+For every PR the integration (`Integrate PR #N`) is a merge. If it conflicts:
+
+1. The PR number is known (it is the one being merged) and each conflicted file is listed; for files that an *earlier picked PR* also changed, that PR is named ("also changed by picked PR(s): #3").
+2. The same algorithm as `git mergetool` runs over every conflicted file. If it fixes them all, the merge is committed as `Integrate PR #N` and the fixed files are listed.
+3. If any file is left, the operation is cancelled with its own abort command (`git merge --abort`; `git cherry-pick --abort` when a cherry-pick is what is in progress). The branch is then verified to be exactly as before the PR (same commit, clean tree); if not, the PR is reported as an ERROR and picking stops.
+4. At a terminal it asks after each failure: `Continue with the remaining PR(s) ...? [Y]es / [n]o, stop here / [a]lways continue`. Enter = yes (the PRs after the failed one are still picked); `n` stops, the rest are reported as not attempted; `a` continues and does not ask again. Without a terminal (scripts, CI) it never asks and continues. `--continue-on-conflict` skips the question and continues; `--stop-on-conflict` skips it and stops.
+5. A summary ends with a `Result:` line, for example `Result: FAILURE - needs manual intervention: PR #2`.
+
+Exit status of `git pullreqs -p`: `0` everything integrated, `2` one or more PRs failed on conflicts (the others were integrated), `1` a real error (bad PR number, dirty tree, abort failed). `--leave-conflicts` does not abort a PR the algorithm cannot fix: it leaves the merge in progress (what it could fix is already staged) so you can run `git mergetool` and `git commit`, and it stops there. Options: `--no-auto-resolve` (abort at the first conflict, no algorithm), `--stop-on-conflict`, `--status-file FILE` (per-PR JSON: status, files, reasons, abort command; `failed_prs` lists the PR numbers).
+
+`git drop -N` re-merges the kept PRs the same way; if one of them can no longer be merged it prints `FAILURE: PR #N ...`, aborts and changes nothing.
+
+### Batch script: `integrate-prs.sh`
+
+`integrate-prs.sh` (or `integrate-prs.sh 14 15 16` for chosen PRs) runs `git pullreqs -p N` for every PR of `git pullreqs --oneline`, using your PR numbers. Phase 1 is automatic: a failed PR is cleaned up (`git cherry-pick --abort` / `git merge --abort`, whichever is in progress; nothing in progress is fine because `git pullreqs` already aborted) and the rest continue. If a cleanup fails it stops (exit 2). Then it lists the unfinished PRs with their full description and asks `Do you want to retry the unfinished PRs interactively? [y/N]`. On `y`, each one runs `git pullreqs -p N --leave-conflicts`, `git mergetool -y`, `git commit` (and `git cherry-pick --continue` for multi-commit cherry-picks); if that fails the PR is aborted and stays unfinished. It refuses to start with a cherry-pick/merge pending or uncommitted changes (exit 3). Exit codes: 0 all integrated, 1 some unfinished, 2 abort failed, 3 refused.
+
+For your own shell scripts, any stopped merge/cherry-pick/revert can be handled with:
+
+```sh
+git cherry-pick "$sha" || smartfix-mergetool --resolve-or-abort --pr 42
+case $? in 0) echo ok ;; 1) echo "PR 42 needs a human" ;; 2) echo "abort failed" ;; esac
+```
+
+Exit `0` = conflicts fixed and the operation continued, `1` = aborted cleanly, `2` = nothing in progress or the abort itself failed.
+
 ## Good to know
-* A conflict while picking stops with the PR named. Fix and `git commit --no-edit`, or `git merge --abort`.
+* A conflict while picking never leaves a half-done merge: see "Conflicts while picking" above.
 * Undo a rewrite: `git drop` prints the previous tip: `git reset --hard <sha>`.
 * `git drop` and `-p` show PR titles when `gh` is installed and logged in.
 PM_EOF_DOC

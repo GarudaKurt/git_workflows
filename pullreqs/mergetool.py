@@ -631,6 +631,133 @@ def as_mergetool(base_p: str, local_p: str, remote_p: str, merged_p: str) -> int
     return 0
 
 
+
+# ---------------------------------------------------------------- batch mode (no files, no prompts)
+# Used by `git pullreqs -p`, `git drop` and `smartfix-mergetool --resolve-or-abort`:
+# fix every unmerged path with the same algorithm, or leave the repository exactly as it was.
+
+OPERATIONS = (("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"))
+
+
+def git_dir() -> str:
+    return git_out("rev-parse", "--absolute-git-dir")
+
+
+def operation() -> str:
+    """'merge', 'cherry-pick', 'revert', 'rebase' or '' (nothing in progress)."""
+    for ref, name in OPERATIONS:
+        if _run("git", "rev-parse", "-q", "--verify", ref).returncode == 0:
+            return name
+    gd = git_dir()
+    if os.path.isdir(os.path.join(gd, "rebase-merge")) or os.path.isdir(os.path.join(gd, "rebase-apply")):
+        return "rebase"
+    return ""
+
+
+def abort_operation() -> Tuple[bool, str, str]:
+    """Cancel whatever is in progress with its own abort command (git cherry-pick --abort, git merge --abort,
+    ...).  Returns (ok, command_run, detail).  ok means: nothing is in progress any more."""
+    op = operation()
+    if not op:
+        return True, "", "nothing was in progress"
+    cmd = ["git", op, "--abort"]
+    r = _run(*cmd)
+    still = operation()
+    detail = (r.stderr or r.stdout).decode(ENC, ERR).strip()
+    return (r.returncode == 0 and not still), " ".join(cmd), detail
+
+
+def unmerged_paths() -> List[str]:
+    r = _run("git", "diff", "--name-only", "--diff-filter=U", "-z")
+    return [x.decode(ENC, ERR) for x in r.stdout.split(b"\0") if x]
+
+
+def _stages(path: str) -> dict:
+    """{stage: (mode, sha)} of an unmerged path, from the index."""
+    r = _run("git", "ls-files", "-u", "-z", "--", ":(literal)" + path)
+    out = {}
+    for e in r.stdout.split(b"\0"):
+        if e:
+            meta, _, _ = e.partition(b"\t")
+            mode, sha, stage = meta.decode().split(" ")
+            out[int(stage)] = (mode, sha)
+    return out
+
+
+def _blob(sha: str) -> bytes:
+    return _run("git", "cat-file", "blob", sha).stdout
+
+
+def resolve_index(strict: Optional[bool] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Run the algorithm over every unmerged path of the current merge/cherry-pick/...  Fully fixed files are
+    written and `git add`ed.  Returns (resolved_paths, [(path, why_not)]).  Files with hunks left are not touched."""
+    if strict is None:
+        strict = config("smartfix.level", "review") == "safe"
+    top = git_out("rev-parse", "--show-toplevel")
+    if top:
+        os.chdir(top)                  # unmerged paths are root-relative; git resolves pathspecs from the cwd
+    fixed, failed = [], []
+    for path in unmerged_paths():
+        st = _stages(path)
+        if 2 not in st or 3 not in st:
+            failed.append((path, "deleted on one side and changed on the other"))
+            continue
+        if any(st[k][0] in ("120000", "160000") for k in st):
+            failed.append((path, "symlink or submodule: choose a side by hand"))
+            continue
+        res = resolve_bytes(path, _blob(st[1][1]) if 1 in st else None, _blob(st[2][1]), _blob(st[3][1]),
+                            strict, has_base=1 in st)
+        if res.status == "resolved" and res.data is not None:
+            try:
+                with open(path, "wb") as f:
+                    f.write(res.data)
+            except OSError as e:
+                failed.append((path, "cannot write: {}".format(e)))
+                continue
+            if _run("git", "add", "--", path).returncode != 0:
+                failed.append((path, "git add failed"))
+                continue
+            fixed.append(path)
+        else:
+            why = res.note or "{} hunk(s) need a human decision".format(len(res.hards) or 1)
+            failed.append((path, why))
+    return fixed, failed
+
+
+def resolve_or_abort(pr: Optional[int] = None) -> int:
+    """Finish the operation in progress if the algorithm can fix every conflict, else abort it cleanly.
+    Exit status: 0 resolved and continued, 1 conflicts left, operation aborted, 2 could not (nothing in
+    progress, or the abort itself failed)."""
+    label = "PR #{}".format(pr) if pr is not None else "this change"
+    top = git_out("rev-parse", "--show-toplevel")
+    if top:
+        os.chdir(top)
+    op = operation()
+    if not op:
+        print("smartfix: FAILURE: no merge, cherry-pick, revert or rebase is in progress.", file=sys.stderr)
+        return 2
+    before = unmerged_paths()
+    fixed, failed = resolve_index()
+    if not failed and not unmerged_paths():
+        env = dict(os.environ, GIT_EDITOR="true")
+        r = subprocess.run(["git", op, "--continue"], capture_output=True, env=env)
+        if r.returncode == 0 and not operation():
+            print("smartfix: SUCCESS: {} conflict(s) in {} resolved automatically: {}"
+                  .format(len(fixed), label, ", ".join(fixed) or "-"))
+            return 0
+        failed = [("(continue)", (r.stderr or r.stdout).decode(ENC, ERR).strip() or "git {} --continue failed".format(op))]
+    ok, cmd, detail = abort_operation()
+    print("smartfix: FAILURE: {} needs manual intervention.".format(label), file=sys.stderr)
+    for path, why in failed:
+        print("  {}: {}".format(path, why), file=sys.stderr)
+    if ok:
+        print("smartfix: ran '{}'; the working tree is back to its state before {}.".format(cmd, label), file=sys.stderr)
+        return 1
+    print("smartfix: '{}' FAILED: {}\nsmartfix: the repository is still mid-{}; finish or abort it by hand."
+          .format(cmd, detail, op), file=sys.stderr)
+    return 2
+
+
 # Visual tools for the conflicts the algorithm leaves.  $MERGED already holds the automatic fixes.
 FALLBACK_TOOLS = {
     "vimdiff": 'vim -f -d -c "4wincmd w | wincmd J" "$LOCAL" "$BASE" "$REMOTE" "$MERGED"',
@@ -749,8 +876,14 @@ def main(argv=None) -> int:
                         "(editor, {})".format(", ".join(sorted(FALLBACK_TOOLS))))
     p.add_argument("--migrate", action="store_true", help="update an old 'git smartfix' mergetool setting")
     p.add_argument("--auto", action="store_true", help="what the installer runs: make git mergetool use this tool")
+    p.add_argument("--resolve-or-abort", action="store_true",
+                   help="for scripts: fix every conflict of the merge/cherry-pick in progress with the algorithm "
+                        "and continue it, or abort it cleanly. Exit 0 resolved, 1 aborted, 2 could not abort")
+    p.add_argument("--pr", type=int, metavar="N", help="with --resolve-or-abort: the PR number to name in the report")
     args = p.parse_args(argv)
     try:
+        if args.resolve_or_abort:
+            return resolve_or_abort(args.pr)
         if args.install:
             return install_tool("local" if args.local else "global", args.default, args.fallback or "")
         if args.migrate:

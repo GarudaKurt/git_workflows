@@ -5,6 +5,8 @@
     git drop -3           drop the FIRST 3 PRs of that list (positions 1-3)
     git drop -3 --dry-run show what would happen
     git drop --all        list: also show PRs already promoted to main
+    git drop --files      list: also show the files each PR changed
+    git drop -1 --save DIR   keep the copy of the dropped PR(s) in DIR (default: inside .git)
 
 The number in `git drop -N` is a POSITION in the displayed list, not a PR ID:
 `git drop -3` removes positions 1, 2 and 3 whatever their PR numbers are.
@@ -14,17 +16,24 @@ merged again, in the same order and at the exact commit that was tested.  The
 original pull requests and their commits stay untouched on development.  Nothing is
 brought back automatically; re-pick what you want with: git pullreqs -p <PR ID>
 
+Before anything is rewritten, a COPY of what you are dropping is saved (see --save):
+for every dropped PR the list of files, a patch (PR-<n>.patch) and the files themselves
+as they were in that PR (files/PR-<n>/...).  Default place: <repo>/.git/pullreqs-dropped/
+<date-time>/ .   git drop --files lists the files of every picked PR without dropping.
+
 If origin/integrations holds the dropped PRs it is updated too, with
 --force-with-lease (it refuses if somebody else pushed in the meantime), so your next
 plain `git push` keeps working.  Use --no-push to leave origin alone.
 """
 import argparse
+import datetime
+import os
 import re
 import sys
-from typing import List
+from typing import List, Optional, Tuple
 
-from .integration import ensure_clean_worktree, ensure_integrations_branch
-from .staging import (StagingError, fetch, git, integrated_merges, integrations_branch, is_ancestor,
+from .integration import ensure_clean_worktree, ensure_integrations_branch, merge_pr
+from .staging import (StagingError, goto_toplevel, fetch, git, integrated_merges, integrations_branch, is_ancestor,
                       pr_title, remote_name, remote_ref, rev, target_branch, target_ref, working_ref)
 
 
@@ -34,6 +43,82 @@ def _warn_remote_only(remote, remote_only) -> None:
               "  you dropped them  ->  git push --force-with-lease\n"
               "  someone pushed them  ->  git pull --ff-only"
               .format(remote, ", ".join("#%d" % n for n in remote_only)))
+
+
+def pr_files(merge_sha: str) -> List[Tuple[str, str]]:
+    """Files a picked PR brought into integrations: [(status, path)], status A/M/D/R/T (R shows 'old -> new')."""
+    out = git("diff", "--name-status", "-z", "-M", merge_sha + "^1", merge_sha).stdout.split("\0")
+    files, i = [], 0
+    while i < len(out) and out[i]:
+        st = out[i][0]
+        if st in "RC":
+            files.append(("R" if st == "R" else "A", "{} -> {}".format(out[i + 1], out[i + 2]) if st == "R" else out[i + 2]))
+            i += 3
+        else:
+            files.append((st, out[i + 1]))
+            i += 2
+    return files
+
+
+def _final_path(path: str) -> str:
+    return path.split(" -> ")[-1]
+
+
+def _cat(sha: str, path: str) -> Optional[bytes]:
+    """Content of path at commit sha as bytes; None for submodules or anything that is not a file."""
+    import subprocess
+    r = subprocess.run(["git", "cat-file", "blob", "{}:{}".format(sha, path)], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def save_copy(dropped, dest_root: Optional[str], titles: bool) -> str:
+    """Write the copy of the PRs about to be dropped. Returns the folder. Raises StagingError if it cannot."""
+    if dest_root is None:
+        gitdir = git("rev-parse", "--absolute-git-dir").stdout.strip()
+        dest_root = os.path.join(gitdir, "pullreqs-dropped")
+    dest_root = os.path.abspath(os.path.expanduser(dest_root))
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(dest_root, "dropped-" + stamp)
+    n = 1
+    while os.path.exists(folder):                 # two drops in the same second
+        n += 1
+        folder = os.path.join(dest_root, "dropped-{}-{}".format(stamp, n))
+    try:
+        os.makedirs(folder)
+        lines = ["Dropped from {} on {}".format(integrations_branch(), datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")), ""]
+        for pos, (number, sha, short) in enumerate(dropped, 1):
+            title = (pr_title(number) or "") if titles else ""
+            tested = rev(sha + "^2")[:10]
+            files = pr_files(sha)
+            lines.append("{}. PR #{}  tested commit {}  merge {}  {}".format(pos, number, tested, sha[:10], title).rstrip())
+            lines += ["     {}  {}".format(st, p) for st, p in files] or ["     (no file changes)"]
+            lines.append("")
+            patch = git("diff", "--binary", "-M", sha + "^1", sha).stdout
+            with open(os.path.join(folder, "PR-{}.patch".format(number)), "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(patch)
+            for st, p in files:
+                if st == "D":
+                    continue
+                path = _final_path(p)
+                parts = path.replace("\\", "/").split("/")
+                if path.startswith("/") or ".." in parts:
+                    continue                                        # never write outside the folder
+                data = _cat(sha, path)
+                if data is None:
+                    continue
+                target = os.path.join(folder, "files", "PR-{}".format(number), *parts)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as f:
+                    f.write(data)
+        lines.append("Restore: git pullreqs -p <PR number>   (the original PRs are untouched)")
+        lines.append("A patch is in PR-<n>.patch (git apply it on the state before the PR); files/ holds each file as the PR left it.")
+        with open(os.path.join(folder, "summary.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        raise StagingError("could not save a copy of the dropped PR(s) to {}: {}\n"
+                           "Nothing was changed. Choose another place with --save DIR, or skip it with --no-save."
+                           .format(folder, e.strerror or e))
+    return folder
 
 
 def list_prs(args) -> int:
@@ -68,7 +153,7 @@ def list_prs(args) -> int:
 
     titles_ok = not args.no_titles
     position = 0
-    for number, _, short in rows:
+    for number, sha, short in rows:
         if number in pending:
             position += 1
             label = "{:>3}.".format(position)
@@ -83,6 +168,9 @@ def list_prs(args) -> int:
             else:
                 title = "  " + found
         print("{} PR #{:<8} Commit: {}{}   [{}]".format(label, number, short, title, status))
+        if args.files:
+            for st, p in pr_files(sha):
+                print("          {}  {}".format(st, p))
 
     print("\nTotal: {} pull request(s) in the trial integration".format(position))
     if position:
@@ -97,6 +185,7 @@ def list_prs(args) -> int:
 
 def drop_first(args, count: int) -> int:
     name, target, remote = integrations_branch(), target_branch(), remote_name()
+    goto_toplevel()
     ensure_clean_worktree()
     ensure_integrations_branch(create=False)           # fetches, switches, fast-forwards if behind
 
@@ -125,6 +214,10 @@ def drop_first(args, count: int) -> int:
     print("Trial integration has {} PR(s). Dropping the first {}:".format(len(merges), count))
     print("  Drop : {}".format(fmt(dropped, 1)))
     print("  Keep : {}   (positions after the drop: 1..{})".format(fmt(kept, count + 1), len(kept)))
+    print("  Files in the dropped PR(s):")
+    for number, sha, _ in dropped:
+        for st, p in pr_files(sha) or [("-", "(no file changes)")]:
+            print("    #{:<6} {}  {}".format(number, st, p))
 
     old_tip, published = rev(name), remote_ref(name)
     published_sha = rev(published) if published else None
@@ -137,20 +230,28 @@ def drop_first(args, count: int) -> int:
     if not args.yes:
         if not sys.stdin.isatty():
             raise StagingError("Not a terminal: add --yes to confirm.")
-        if input("\nRewrite {} without these PRs? [y/N] ".format(name)).strip().lower() not in ("y", "yes"):
+        # asked on stderr, so `git drop -1 > report.txt` still shows the question
+        sys.stderr.write("Rewrite {} without {}? [y/N] ".format(name, ", ".join("#%d" % n for n, _, _ in dropped)))
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
             print("Aborted. Nothing was changed.")
             return 1
+    if not args.no_save:
+        folder = save_copy(dropped, args.save, titles=not args.no_titles)
+        print("\nSaved a copy of the dropped PR(s): {}".format(folder))
+        print("  summary.txt (files per PR), PR-<n>.patch, files/PR-<n>/<the files as the PR left them>")
 
     git("switch", "--detach", base)                     # rebuild off to the side; branch untouched until done
     try:
         for number, sha, _ in kept:
-            r = git("merge", "--no-ff", "-m", "Integrate PR #{}".format(number), sha + "^2", check=False)
-            if r.returncode != 0:
-                git("merge", "--abort", check=False)
+            o = merge_pr(number, sha + "^2")
+            if not o.ok:
+                why = "; ".join("{} ({})".format(f, o.reasons.get(f, "conflict")) for f in o.files) or o.detail
                 raise StagingError(
-                    "PR #{} no longer merges cleanly without the dropped PR(s):\n{}\n"
-                    "Nothing was changed ({} is as before). Drop more PRs (a bigger N), or resolve it by hand."
-                    .format(number, (r.stdout + r.stderr).strip(), name))
+                    "FAILURE: PR #{} no longer merges cleanly without the dropped PR(s): {}\n"
+                    "The merge was aborted ({}) and nothing was changed ({} is as before). "
+                    "Drop more PRs (a bigger N), or resolve PR #{} by hand."
+                    .format(number, why, o.abort or "git merge --abort", name, number))
         new_tip = rev("HEAD")
     except StagingError:
         git("switch", name)
@@ -182,6 +283,10 @@ def main(argv: List[str] = None) -> int:
     p.add_argument("--all", action="store_true", help="list: also show PRs already in the target branch")
     p.add_argument("--no-fetch", action="store_true", help="list: do not fetch the remote first")
     p.add_argument("--no-titles", action="store_true", help="list: skip the PR title lookup (gh)")
+    p.add_argument("--files", action="store_true", help="list: also show the files each PR changed")
+    p.add_argument("--save", metavar="DIR", help="drop: where to keep the copy of the dropped PR(s) "
+                                                  "(default: <repo>/.git/pullreqs-dropped)")
+    p.add_argument("--no-save", action="store_true", help="drop: do not keep a copy")
     p.add_argument("--dry-run", action="store_true", help="drop: show the plan only")
     p.add_argument("-y", "--yes", action="store_true", help="drop: do not ask for confirmation")
     p.add_argument("--no-push", action="store_true", help="drop: do not update origin/integrations")

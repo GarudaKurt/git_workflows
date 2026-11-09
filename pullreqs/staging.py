@@ -37,6 +37,15 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return r
 
 
+def goto_toplevel() -> None:
+    """Work from the repository root.  Git prints paths relative to the root but resolves pathspecs relative to the
+    current directory, so running from a sub-folder would make every conflicted path look missing."""
+    import os
+    r = git("rev-parse", "--show-toplevel", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        os.chdir(r.stdout.strip())
+
+
 def config(key: str, default: str) -> str:
     r = git("config", "--get", key, check=False)
     value = r.stdout.strip()

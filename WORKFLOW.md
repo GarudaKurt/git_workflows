@@ -107,7 +107,34 @@ Notes:
 * An older version had a `git smartfix` command. It is gone; the installer converts its mergetool setting automatically.
 * `smartfix-mergetool` is the program `git mergetool` launches. You never run it yourself.
 
+## Conflicts while picking: `git pullreqs -p`
+
+For every PR the integration (`Integrate PR #N`) is a merge. If it conflicts:
+
+1. The PR number is known (it is the one being merged) and each conflicted file is listed; for files that an *earlier picked PR* also changed, that PR is named ("also changed by picked PR(s): #3").
+2. The same algorithm as `git mergetool` runs over every conflicted file. If it fixes them all, the merge is committed as `Integrate PR #N` and the fixed files are listed.
+3. If any file is left, the operation is cancelled with its own abort command (`git merge --abort`; `git cherry-pick --abort` when a cherry-pick is what is in progress). The branch is then verified to be exactly as before the PR (same commit, clean tree); if not, the PR is reported as an ERROR and picking stops.
+4. At a terminal it asks after each failure: `Continue with the remaining PR(s) ...? [Y]es / [n]o, stop here / [a]lways continue`. Enter = yes (the PRs after the failed one are still picked); `n` stops, the rest are reported as not attempted; `a` continues and does not ask again. Without a terminal (scripts, CI) it never asks and continues. `--continue-on-conflict` skips the question and continues; `--stop-on-conflict` skips it and stops.
+5. A summary ends with a `Result:` line, for example `Result: FAILURE - needs manual intervention: PR #2`.
+
+Exit status of `git pullreqs -p`: `0` everything integrated, `2` one or more PRs failed on conflicts (the others were integrated), `1` a real error (bad PR number, dirty tree, abort failed). `--leave-conflicts` does not abort a PR the algorithm cannot fix: it leaves the merge in progress (what it could fix is already staged) so you can run `git mergetool` and `git commit`, and it stops there. Options: `--no-auto-resolve` (abort at the first conflict, no algorithm), `--stop-on-conflict`, `--status-file FILE` (per-PR JSON: status, files, reasons, abort command; `failed_prs` lists the PR numbers).
+
+`git drop -N` re-merges the kept PRs the same way; if one of them can no longer be merged it prints `FAILURE: PR #N ...`, aborts and changes nothing.
+
+### Batch script: `integrate-prs.sh`
+
+`integrate-prs.sh` (or `integrate-prs.sh 14 15 16` for chosen PRs) runs `git pullreqs -p N` for every PR of `git pullreqs --oneline`, using your PR numbers. Phase 1 is automatic: a failed PR is cleaned up (`git cherry-pick --abort` / `git merge --abort`, whichever is in progress; nothing in progress is fine because `git pullreqs` already aborted) and the rest continue. If a cleanup fails it stops (exit 2). Then it lists the unfinished PRs with their full description and asks `Do you want to retry the unfinished PRs interactively? [y/N]`. On `y`, each one runs `git pullreqs -p N --leave-conflicts`, `git mergetool -y`, `git commit` (and `git cherry-pick --continue` for multi-commit cherry-picks); if that fails the PR is aborted and stays unfinished. It refuses to start with a cherry-pick/merge pending or uncommitted changes (exit 3). Exit codes: 0 all integrated, 1 some unfinished, 2 abort failed, 3 refused.
+
+For your own shell scripts, any stopped merge/cherry-pick/revert can be handled with:
+
+```sh
+git cherry-pick "$sha" || smartfix-mergetool --resolve-or-abort --pr 42
+case $? in 0) echo ok ;; 1) echo "PR 42 needs a human" ;; 2) echo "abort failed" ;; esac
+```
+
+Exit `0` = conflicts fixed and the operation continued, `1` = aborted cleanly, `2` = nothing in progress or the abort itself failed.
+
 ## Good to know
-* A conflict while picking stops with the PR named. Fix and `git commit --no-edit`, or `git merge --abort`.
+* A conflict while picking never leaves a half-done merge: see "Conflicts while picking" above.
 * Undo a rewrite: `git drop` prints the previous tip: `git reset --hard <sha>`.
 * `git drop` and `-p` show PR titles when `gh` is installed and logged in.

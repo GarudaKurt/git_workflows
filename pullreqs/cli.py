@@ -27,6 +27,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "(extra args after `--` go to `gh pr create`)")
     g.add_argument("--report", action="store_true",
                    help="write an HTML dashboard: PR counts, authors, latest commits and the drop list")
+    p.add_argument("--no-auto-resolve", action="store_true",
+                   help="with -p: do not try the automatic conflict algorithm; abort a conflicting PR at once")
+    p.add_argument("--stop-on-conflict", action="store_true",
+                   help="with -p: stop at the first PR that fails, without asking")
+    p.add_argument("--continue-on-conflict", action="store_true",
+                   help="with -p: carry on with the other PRs after a failure, without asking "
+                        "(default at a terminal: ask; without a terminal: carry on)")
+    p.add_argument("--leave-conflicts", action="store_true",
+                   help="with -p: when the algorithm cannot fix a PR, leave the merge in progress (what it could "
+                        "fix is staged) for git mergetool / git commit, instead of aborting. Stops there")
+    p.add_argument("--status-file", metavar="FILE", help="with -p: also write the per-PR result as JSON")
     p.add_argument("-o", "--output", default="pullreqs-report.html", metavar="FILE",
                    help="with --report: the file to write (default: pullreqs-report.html)")
     p.add_argument("-t", "--title", metavar="TITLE", help="with --create: the PR title (default: from your commits)")
@@ -73,7 +84,7 @@ def cmd_oneline(provider, store):
               f"[{pr.author}] {pr.title}{suffix}")
 
 
-def cmd_pick(tokens: List[str]):
+def cmd_pick(tokens: List[str], args=None) -> int:
     """Pick PRs: merge each one into the local integrations branch, for testing."""
     def all_open() -> List[int]:
         return [int(p.native_id) for p in ShellProvider(load_config()).list()]
@@ -81,8 +92,12 @@ def cmd_pick(tokens: List[str]):
     numbers = parse_numbers(tokens, all_open)
     if not numbers:
         raise PullreqsError("No pull request numbers given.")
-    merged, skipped = integrate(numbers)
-    name = integrations_branch()
+    rep = integrate(numbers, auto=not (args and args.no_auto_resolve),
+                    stop_on_conflict=bool(args and args.stop_on_conflict),
+                    ask=not (args and args.continue_on_conflict),
+                    leave_conflicts=bool(args and args.leave_conflicts),
+                    status_file=args.status_file if args else None)
+    merged, skipped, name = rep.merged, rep.skipped, integrations_branch()
     print("\nPicked into {}: {}".format(name, ", ".join("#%d" % n for n in merged) or "nothing new"))
     if skipped:
         print("Already there : {}".format(", ".join("#%d" % n for n in skipped)))
@@ -90,6 +105,7 @@ def cmd_pick(tokens: List[str]):
     print("  git push                         publish the validated picks to origin/{}".format(name))
     print("  git drop                         numbered list of what is picked")
     print("  git drop -N                      drop the first N of that list")
+    return rep.exit_code
 
 
 def cmd_report(output: str):
@@ -127,8 +143,7 @@ def main(argv=None) -> int:
         if extra and not args.create:
             raise PullreqsError(f"unrecognized arguments: {' '.join(extra)}")
         if args.pick is not None:
-            cmd_pick(args.pick)
-            return 0
+            return cmd_pick(args.pick, args)
         if args.report:
             cmd_report(args.output)
             return 0
