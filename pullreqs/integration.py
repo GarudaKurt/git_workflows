@@ -8,6 +8,7 @@ origin/integrations if QA already pushed it.  It is set up to track
 origin/integrations, so a plain `git push` publishes it.
 """
 import json
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -97,7 +98,10 @@ class PrOutcome:
     culprits: Dict[str, List[int]] = field(default_factory=dict)  # failed file -> earlier picked PRs touching it
     detail: str = ""
     abort: str = ""                                          # the abort command that was run
-    pending: bool = False                                    # --leave-conflicts: the merge was left in progress
+    pending: bool = False                                    # the merge was left in progress, waiting for a decision
+    held: bool = False                                       # paused: aborted on purpose, to be picked again later
+    manual: bool = False                                     # the conflicts were fixed by hand
+    before: str = ""                                         # HEAD before the merge, to verify a clean abort
 
     @property
     def ok(self) -> bool:
@@ -128,14 +132,15 @@ class Report:
     def exit_code(self) -> int:
         if any(o.status == "error" for o in self.outcomes):
             return EXIT_ERROR
-        return EXIT_CONFLICT if self.failed else EXIT_OK
+        return EXIT_CONFLICT if (self.failed or self.by("not_attempted")) else EXIT_OK
 
     def to_dict(self) -> dict:
         return {"branch": self.branch, "exit_code": self.exit_code, "ok": not self.failed,
                 "failed_prs": [o.number for o in self.failed],
                 "prs": [{"pr": o.number, "status": o.status, "files": o.files, "reasons": o.reasons,
                          "also_touched_by": {f: v for f, v in o.culprits.items()},
-                         "abort_command": o.abort, "left_in_progress": o.pending, "detail": o.detail} for o in self.outcomes]}
+                         "abort_command": o.abort, "left_in_progress": o.pending, "paused": o.held,
+                         "fixed_by_hand": o.manual, "detail": o.detail} for o in self.outcomes]}
 
 
 def _touching(path: str, exclude: int) -> List[int]:
@@ -164,7 +169,7 @@ def merge_pr(number: int, ref: str, auto: bool = True, leave: bool = False) -> P
     r = git("merge", "--no-ff", "-m", msg, ref, check=False)
     if r.returncode == 0:
         return PrOutcome(number, "merged")
-    out = PrOutcome(number, "failed")
+    out = PrOutcome(number, "failed", before=before)
     if not mt.operation():                                   # git refused before starting (e.g. untracked file in the way)
         out.status, out.detail = "error", (r.stderr or r.stdout).strip()
         return out
@@ -187,29 +192,39 @@ def merge_pr(number: int, ref: str, auto: bool = True, leave: bool = False) -> P
     if leave:
         out.pending = True
         return out
+    abort_pr(out)
+    return out
+
+
+def abort_pr(out: PrOutcome) -> bool:
+    """Cancel the merge in progress for `out` (git merge --abort / git cherry-pick --abort) and verify the branch is
+    exactly as before.  False (and status 'error') if that could not be confirmed."""
+    from . import mergetool as mt
     ok, cmd, detail = mt.abort_operation()
-    out.abort = cmd
-    if not ok or rev("HEAD") != before or git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+    out.abort, out.pending = cmd, False
+    if not ok or (out.before and rev("HEAD") != out.before) or git("status", "--porcelain", "--untracked-files=no").stdout.strip():
         out.status = "error"
         out.detail = "could not abort cleanly ({}): {}".format(cmd, detail)
-        return out
-    out.culprits = {f: _touching(f, number) for f in out.files}
-    return out
+        return False
+    out.culprits = {f: _touching(f, out.number) for f in out.files}
+    return True
 
 
 def _print_outcome(o: PrOutcome, branch: str) -> None:
     if o.status == "merged":
         print("  PR #{}: merged".format(o.number))
     elif o.status == "resolved":
-        print("  PR #{}: merged, {} conflicting file(s) fixed automatically: {}".format(o.number, len(o.files), ", ".join(o.files)))
+        print("  PR #{}: merged, {} conflicting file(s) fixed {}: {}".format(
+            o.number, len(o.files), "by hand" if o.manual else "automatically", ", ".join(o.files)))
     elif o.status == "failed":
-        print("  PR #{}: FAILED, conflicts the algorithm cannot resolve:".format(o.number))
+        print("  PR #{}: {}, conflicts the algorithm cannot resolve:".format(
+            o.number, "PAUSED (held for later)" if o.held else "FAILED"))
         for f in o.files:
             print("      {}  ({})".format(f, o.reasons.get(f, "conflict")))
             if o.culprits.get(f):
                 print("        also changed by picked PR(s): {}".format(", ".join("#%d" % n for n in o.culprits[f])))
         if o.pending:
-            print("      merge LEFT IN PROGRESS for you: git mergetool, then git commit (or git merge --abort)")
+            print("      merge left in progress (--leave-conflicts): git mergetool, then git commit, or git merge --abort")
         else:
             print("      ran '{}': {} is unchanged".format(o.abort, branch))
     elif o.status == "error":
@@ -222,9 +237,20 @@ def print_report(rep: Report) -> None:
         if o.status == "skipped":
             print("  PR #{}: already there".format(o.number))
         elif o.status == "not_attempted":
-            print("  PR #{}: not attempted (stopped after the first failure)".format(o.number))
+            print("  PR #{}: not attempted (the run was stopped before it)".format(o.number))
         else:
             _print_outcome(o, rep.branch)
+    conflicts = [o for o in rep.failed if o.status == "failed" and o.files]
+    if conflicts:
+        print("\nConflict report:")
+        for o in conflicts:
+            print("[CONFLICT] PR #{}".format(o.number))
+            for f in o.files:
+                print("  - {}".format(f))
+    held = [o.number for o in rep.outcomes if o.held]
+    if held:
+        print("\nPaused PR(s), held for later: {}   (pick them again with: git pullreqs -p {})".format(
+            ", ".join("#%d" % n for n in held), " ".join(str(n) for n in held)))
     if rep.failed:
         nums = ", ".join("#%d" % o.number for o in rep.failed)
         print("\nResult: FAILURE - needs manual intervention: PR {}".format(nums))
@@ -233,33 +259,106 @@ def print_report(rep: Report) -> None:
         print("\nResult: SUCCESS - {} PR(s) integrated".format(len(rep.merged)))
 
 
-def _ask_continue(failed: int, remaining: List[int]) -> str:
-    """Ask at a terminal whether to go on.  Returns 'yes', 'no' or 'all' (do not ask again).
-    Enter = yes, which is the default behaviour.  Without a terminal nothing is asked."""
-    if not (sys.stdin.isatty() and sys.stderr.isatty()):
-        return "yes"
-    nums = ", ".join("#%d" % n for n in remaining)
+def _tty() -> bool:
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _read(prompt: str) -> str:
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    line = sys.stdin.readline()
+    return line.strip().lower() if line else ""         # input closed: the default (pause)
+
+
+def _ask_conflict(o: PrOutcome, remaining: List[int]) -> str:
+    """What to do with a PR whose conflicts the algorithm could not fix.  Returns f, x, p, d or a (Enter = p)."""
+    err = sys.stderr.write
+    err("\nPR #{} has conflicts the algorithm could not resolve:\n".format(o.number))
+    for f in o.files:
+        err("  - {}  ({})\n".format(f, o.reasons.get(f, "conflict")))
+        if o.culprits.get(f):
+            err("      also changed by picked PR(s): {}\n".format(", ".join("#%d" % n for n in o.culprits[f])))
+    more = bool(remaining)
+    err("\nWhat now?\n")
+    err("  [f] Fix it now{}\n".format(", then continue with the remaining PRs" if more else ""))
+    if more:
+        err("  [x] Fix it now, then STOP (remaining PRs are not integrated)\n")
+    err("  [p] PAUSE this PR (hold it for later){}\n".format(" and continue with the rest" if more else ""))
+    if more:
+        err("  [d] PAUSE this and ALL future conflicting PRs automatically\n")
+    err("  [a] Abort the run now{}\n".format(" (remaining PRs are not integrated)" if more else ""))
+    allowed = "fxpda" if more else "fpa"
     while True:
-        sys.stderr.write("\nPR #{} failed and was aborted. Continue with the remaining PR(s) {}? "
-                         "[Y]es / [n]o, stop here / [a]lways continue: ".format(failed, nums))
-        sys.stderr.flush()
-        line = sys.stdin.readline()
-        if not line:                                  # input closed: keep the default
-            return "yes"
-        ans = line.strip().lower()
-        if ans in ("", "y", "yes"):
-            return "yes"
-        if ans in ("n", "no", "s", "stop"):
-            return "no"
-        if ans in ("a", "all", "always"):
-            return "all"
+        ans = _read("Choice [p]: ")
+        if ans == "":
+            return "p"
+        if len(ans) == 1 and ans in allowed:
+            return ans
+        err("Please answer one of: {}\n".format(", ".join(allowed)))
+
+
+def _fix_by_hand(o: PrOutcome) -> str:
+    """Run git mergetool on the merge left in progress, then commit it.  Returns 'fixed', 'pause' or 'abort'."""
+    from . import mergetool as mt
+    while True:
+        print("  running: git mergetool -y")
+        sys.stdout.flush()
+        subprocess.run(["git", "mergetool", "-y"])           # inherits the terminal
+        left = mt.unmerged_paths()
+        if not left:
+            body = "Integrate PR #{}\n\nConflicts resolved by hand (git mergetool):\n{}\n".format(
+                o.number, "\n".join("  " + f for f in o.files))
+            c = subprocess.run(["git", "commit", "-q", "-F", "-"], input=body, text=True, capture_output=True)
+            if c.returncode == 0 and not mt.operation():
+                o.status, o.manual, o.pending, o.reasons = "resolved", True, False, {}
+                print("  PR #{}: conflicts fixed and committed as 'Integrate PR #{}'".format(o.number, o.number))
+                return "fixed"
+            problem = "git commit failed: " + (c.stderr or c.stdout).strip()
+        else:
+            problem = "still unresolved: " + ", ".join(left)
+        sys.stderr.write("\n{}\n  [r] run git mergetool again   [p] PAUSE this PR and continue   [a] abort the run\n".format(problem))
+        while True:
+            ans = _read("Choice [p]: ")
+            if ans in ("", "p"):
+                return "pause"
+            if ans == "a":
+                return "abort"
+            if ans == "r":
+                break
+            sys.stderr.write("Please answer one of: r, p, a\n")
+
+
+def _decide(o: PrOutcome, remaining: List[int], state: dict) -> str:
+    """Handle a conflicting PR that is waiting mid-merge.  Returns 'continue' or 'stop'."""
+    choice = "p" if state["auto_pause"] else _ask_conflict(o, remaining)
+    if choice == "d":
+        state["auto_pause"] = True
+        choice = "p"
+    if choice in ("f", "x"):
+        result = _fix_by_hand(o)
+        if result == "fixed":
+            return "stop" if choice == "x" else "continue"
+        choice = "p" if result == "pause" else "a"
+    ok = abort_pr(o)
+    if not ok:
+        print("PR #{}: ERROR {}".format(o.number, o.detail))
+        return "stop"
+    if choice == "p":
+        o.held = True
+        print("  PR #{} paused: the merge was aborted ({}), {} is unchanged. Pick it again later: git pullreqs -p {}".format(
+            o.number, o.abort, "the branch", o.number))
+        return "continue"
+    print("  Run aborted at PR #{}: the merge was aborted ({}).".format(o.number, o.abort))
+    return "stop"
 
 
 def integrate(numbers: List[int], auto: bool = True, stop_on_conflict: bool = False,
-              status_file: Optional[str] = None, ask: bool = True, leave_conflicts: bool = False) -> Report:
+              status_file: Optional[str] = None, ask: bool = True, leave_conflicts: bool = False,
+              brief: bool = False) -> Report:
     """Merge each PR into the integrations branch.  A PR whose conflicts cannot be fixed automatically is
     aborted and reported; the remaining PRs are still tried (unless stop_on_conflict).  At a terminal, with
-    `ask`, the user is asked after each failure whether to go on (Enter = go on).  Returns a Report."""
+    `ask`, the user chooses what to do with each conflicting PR (fix now / pause / pause all / abort the run;
+    Enter = pause).  Returns a Report."""
     if not numbers:
         raise StagingError("No pull request numbers given.")
     goto_toplevel()
@@ -271,6 +370,8 @@ def integrate(numbers: List[int], auto: bool = True, stop_on_conflict: bool = Fa
     name, remote = ensure_integrations_branch(), remote_name()
     rep = Report(name)
     stop = False
+    interactive = bool(ask and not stop_on_conflict and not leave_conflicts and _tty())
+    state = {"auto_pause": False}
     for idx, number in enumerate(numbers):
         if stop:
             rep.outcomes.append(PrOutcome(number, "not_attempted"))
@@ -294,19 +395,32 @@ def integrate(numbers: List[int], auto: bool = True, stop_on_conflict: bool = Fa
             continue
 
         print("Merging PR #{} into {} ...".format(number, name))
-        o = merge_pr(number, "FETCH_HEAD", auto, leave_conflicts)
+        o = merge_pr(number, "FETCH_HEAD", auto, leave_conflicts or interactive)
         rep.outcomes.append(o)
-        if not o.ok:
-            print("PR #{} FAILED: {}".format(number, "; ".join("%s (%s)" % (f, o.reasons.get(f, "conflict")) for f in o.files) or o.detail))
-            if o.status == "error" or stop_on_conflict or o.pending:
-                stop = True
-            elif ask and numbers[idx + 1:]:
-                answer = _ask_continue(number, numbers[idx + 1:])
-                if answer == "no":
-                    stop = True
-                elif answer == "all":
-                    ask = False
-    print_report(rep)
+        if o.ok:
+            continue
+        if o.status == "failed" and o.pending and interactive:      # waiting mid-merge for the person's choice
+            print("\n[CONFLICT] PR #{}".format(number))
+            for f in o.files:
+                print("  - {}".format(f))
+            o.culprits = {f: _touching(f, number) for f in o.files}
+            sys.stdout.flush()
+            stop = _decide(o, numbers[idx + 1:], state) == "stop"
+            continue
+        if brief:
+            pass
+        elif o.files and o.status == "failed":
+            print("\n[CONFLICT] PR #{}".format(number))
+            for f in o.files:
+                print("  - {}".format(f))
+        else:
+            print("PR #{} FAILED: {}".format(number, o.detail))
+        if o.status == "error" or stop_on_conflict or o.pending:
+            stop = True
+        elif o.status == "failed":
+            o.held = True                                            # no terminal / --continue-on-conflict: paused
+    if not brief:
+        print_report(rep)
     if status_file:
         with open(status_file, "w") as f:
             json.dump(rep.to_dict(), f, indent=2)

@@ -56,6 +56,18 @@ def find_open_pr(name: str, target: str):
     return data[0] if data else None
 
 
+def declined_in(merges) -> list:
+    """[(position, PR number)] of picked PRs that were declined (closed without merging) on GitHub.  Best effort:
+    needs gh; a PR whose state cannot be read is not reported."""
+    from .staging import pr_info
+    out = []
+    for position, (number, _sha, _short) in enumerate(merges, 1):
+        info = pr_info(number)
+        if info and info.get("state") == "CLOSED":
+            out.append((position, number))
+    return out
+
+
 def run(args) -> int:
     name, target, remote = integrations_branch(), target_branch(), remote_name()
     message = args.message.strip()
@@ -103,6 +115,16 @@ def run(args) -> int:
     if not pending:
         print("Nothing to promote: every PR on {} is already in {}.".format(source, tref))
         return 0
+    declined = [] if args.allow_declined else declined_in(merges)
+    if declined:
+        raise StagingError(
+            "{} was declined (closed on GitHub) but is still picked into {}:\n  {}\n"
+            "A declined PR must not be promoted. Remove it with  git drop -{}  (positions 1-{} are removed, "
+            "pick the others again with git pullreqs -p), push, test, and rerun. "
+            "To promote anyway: --allow-declined."
+            .format(", ".join("PR #%d" % n for _, n in declined), name,
+                    "\n  ".join("position {}: PR #{}".format(pos, n) for pos, n in declined),
+                    max(pos for pos, _ in declined), max(pos for pos, _ in declined)))
     extra = int(git("rev-list", "--count", "{}..{}".format(tref, source), "--").stdout.strip() or 0)
 
     print("Pull requests to promote into {} (from {}):".format(target, source))
@@ -233,6 +255,8 @@ def main(argv=None) -> int:
                    help="do not merge main back into development afterwards")
     p.add_argument("--no-close", action="store_true",
                    help="do not close picked PRs that GitHub still shows as open")
+    p.add_argument("--allow-declined", action="store_true",
+                   help="promote even if a picked PR was declined (closed) on GitHub")
     p.add_argument("--allow-extra", action="store_true",
                    help="promote even if integrations has commits that are not picked PRs")
     args = p.parse_args(argv)

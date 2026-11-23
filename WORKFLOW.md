@@ -44,7 +44,16 @@ Branch names can be changed: `git config pullreqs.developmentBranch dev`,
 * If a kept PR would conflict after the rebuild, nothing is changed and you are told which PR; use a bigger N or resolve by hand.
 * Refuses when the branch has commits that are not picked PRs (they would be lost).
 
+**Report file:** `git drop -5 ~/tmp/reports.txt` (or `git drop -5 --report FILE`) appends the dropped PRs to the file once the drop has worked, one line each (no time stamp):
+
+```
+PR# 24  [GarudaKurt] remove unnecessary print logs
+```
+
+The author and title come from GitHub (`gh`), else from the PR's commit. `--report-details` writes a longer record with date and time, position, tested/merge commit and files. The file is only ever appended to, so it is a history of drops. The folder must exist; a missing folder, or a folder given instead of a file, is refused before anything is changed (`--dry-run` checks it too, without creating the file). No path = no report. If writing fails after the drop succeeded, the drop stays and the exit code is 3.
+
 ### git push-master -m "message"
+
 * Promotes what is on **origin/integrations**. Refuses if your local branch differs from it (unpushed picks, or a drop not yet pushed), so what is promoted is what you validated.
 * Refuses commits on integrations that did not come through `git pullreqs -p` (`--allow-extra` overrides).
 * Opens a pull request integrations -> main and merges it with a **merge commit**, using your message. All original commits stay in history.  Dropped PRs are not promoted.
@@ -55,6 +64,12 @@ Branch names can be changed: `git config pullreqs.developmentBranch dev`,
 ### git pullreqs --create [-t TITLE] [--draft]
 * Run it on your feature branch: pushes the branch and opens a PR **against development** (title and description from your commits, or `-t`). Prints the PR number QA will use with `-p`.
 * Refuses on `development`, `integrations` or `main`, when there is nothing new to propose, or when the branch's open PR targets another branch. If a PR is already open it just shows it. Extra `gh pr create` options go after `--`, e.g. `-- --label qa`.
+
+### git pullreqs --report --serve [--port N] [--open]
+
+The same dashboard with working **Checkout** buttons. Every open PR row has *Copy link*, *Copy command* (`gh pr checkout N`) and *Checkout*, which switches the repository you started it in to that PR's branch (`gh pr checkout N`, or `git fetch origin pull/N/head` + `git switch` when gh cannot do it; an existing local branch is only switched to, never reset). It listens on 127.0.0.1 only (default port 8765, the next free one if busy; `--port 0` = any), every request needs the random token embedded in the page, only "check out open PR N" is possible, and it refuses while there are uncommitted changes or a merge/cherry-pick/rebase is in progress. Reloading the page refreshes the data. Press Ctrl+C to stop. A saved `.html` (`--report -o FILE`) is a snapshot: it has the copy buttons only.
+
+**Decline from the report.** In the live version (`--serve`) every open PR that is not promoted yet has a red **Decline** button, in the PR table (*Ready to pick*, in integration, ...) and in the integrations list. It opens a dialog with an optional reason; confirming runs `gh pr close N --comment "Declined via git pullreqs report. Reason: ..."`, so the PR becomes *Closed* on GitHub, exactly as when a reviewer declines it. Needs `gh` logged in (closing is a GitHub action, there is no git fallback). A PR that was already picked into integrations is then shown as **Closed, still in integrations**: closing does not remove its merge from the branch, so run `git drop -N` (N = its position) and re-pick the others. `git push-master` refuses to promote a declined PR (override: `--allow-declined`). A saved `.html` snapshot has no Decline buttons. A closed PR shows a **Reopen** button (`gh pr reopen N`), in case it was declined by mistake or the developer has fixed it; GitHub refuses when the branch was deleted or the PR was merged, and the message is shown on the page. A reopened PR is *Ready to pick* again.
 
 ### git pullreqs --report [-o FILE]
 * Writes one self-contained HTML dashboard (default `pullreqs-report.html`): PR counts, each PR's author, branch, latest commit id and message, its stage (ready, picked, in integrations, promoted, wrong target, merged, closed), and the numbered **Drops** list (what `git drop` shows) with a `git drop -N` simulator.
@@ -111,19 +126,30 @@ Notes:
 
 For every PR the integration (`Integrate PR #N`) is a merge. If it conflicts:
 
+0. Each failing PR is printed as `[CONFLICT] PR #34` followed by its unresolved files (`  - path`), and a "Conflict report" repeats them before the `Result:` line.
 1. The PR number is known (it is the one being merged) and each conflicted file is listed; for files that an *earlier picked PR* also changed, that PR is named ("also changed by picked PR(s): #3").
 2. The same algorithm as `git mergetool` runs over every conflicted file. If it fixes them all, the merge is committed as `Integrate PR #N` and the fixed files are listed.
 3. If any file is left, the operation is cancelled with its own abort command (`git merge --abort`; `git cherry-pick --abort` when a cherry-pick is what is in progress). The branch is then verified to be exactly as before the PR (same commit, clean tree); if not, the PR is reported as an ERROR and picking stops.
-4. At a terminal it asks after each failure: `Continue with the remaining PR(s) ...? [Y]es / [n]o, stop here / [a]lways continue`. Enter = yes (the PRs after the failed one are still picked); `n` stops, the rest are reported as not attempted; `a` continues and does not ask again. Without a terminal (scripts, CI) it never asks and continues. `--continue-on-conflict` skips the question and continues; `--stop-on-conflict` skips it and stops.
+4. At a terminal, each conflicting PR shows a menu (Enter = `p`):
+
+   ```
+   [f] Fix it now, then continue with the remaining PRs
+   [x] Fix it now, then STOP (remaining PRs are not integrated)
+   [p] PAUSE this PR (hold it for later) and continue with the rest
+   [d] PAUSE this and ALL future conflicting PRs automatically
+   [a] Abort the run now (remaining PRs are not integrated)
+   ```
+
+   `f`/`x` run `git mergetool -y` on the merge, then commit it as `Integrate PR #N` (no editor); if it is still unresolved you can retry, pause or abort. `p`/`d` abort that PR's merge cleanly and list it as "PAUSED (held for later)" with the command to pick it again. `a` aborts the PR and stops. With only one PR left, `x` and `d` are not offered. Without a terminal (scripts, CI), or with `--continue-on-conflict`, every conflicting PR is paused and the run carries on; `--stop-on-conflict` aborts the run at the first conflict.
 5. A summary ends with a `Result:` line, for example `Result: FAILURE - needs manual intervention: PR #2`.
 
-Exit status of `git pullreqs -p`: `0` everything integrated, `2` one or more PRs failed on conflicts (the others were integrated), `1` a real error (bad PR number, dirty tree, abort failed). `--leave-conflicts` does not abort a PR the algorithm cannot fix: it leaves the merge in progress (what it could fix is already staged) so you can run `git mergetool` and `git commit`, and it stops there. Options: `--no-auto-resolve` (abort at the first conflict, no algorithm), `--stop-on-conflict`, `--status-file FILE` (per-PR JSON: status, files, reasons, abort command; `failed_prs` lists the PR numbers).
+Exit status of `git pullreqs -p`: `0` everything integrated, `2` one or more PRs failed on conflicts (the others were integrated), `1` a real error (bad PR number, dirty tree, abort failed). `--brief` hides the summary and footer (the batch script prints its own). `--leave-conflicts` does not abort a PR the algorithm cannot fix: it leaves the merge in progress (what it could fix is already staged) so you can run `git mergetool` and `git commit`, and it stops there. Options: `--no-auto-resolve` (abort at the first conflict, no algorithm), `--stop-on-conflict`, `--status-file FILE` (per-PR JSON: status, files, reasons, abort command; `failed_prs` lists the PR numbers).
 
 `git drop -N` re-merges the kept PRs the same way; if one of them can no longer be merged it prints `FAILURE: PR #N ...`, aborts and changes nothing.
 
 ### Batch script: `integrate-prs.sh`
 
-`integrate-prs.sh` (or `integrate-prs.sh 14 15 16` for chosen PRs) runs `git pullreqs -p N` for every PR of `git pullreqs --oneline`, using your PR numbers. Phase 1 is automatic: a failed PR is cleaned up (`git cherry-pick --abort` / `git merge --abort`, whichever is in progress; nothing in progress is fine because `git pullreqs` already aborted) and the rest continue. If a cleanup fails it stops (exit 2). Then it lists the unfinished PRs with their full description and asks `Do you want to retry the unfinished PRs interactively? [y/N]`. On `y`, each one runs `git pullreqs -p N --leave-conflicts`, `git mergetool -y`, `git commit` (and `git cherry-pick --continue` for multi-commit cherry-picks); if that fails the PR is aborted and stays unfinished. It refuses to start with a cherry-pick/merge pending or uncommitted changes (exit 3). Exit codes: 0 all integrated, 1 some unfinished, 2 abort failed, 3 refused.
+`integrate-prs.sh` (or `integrate-prs.sh 14 15 16` for chosen PRs) runs `git pullreqs -p N` for every PR of `git pullreqs --oneline`, using your PR numbers. Phase 1 is automatic and prints `[CONFLICT] PR #N` with the unresolved files of each conflicting PR (read before the abort clears them); failures that are not merge conflicts are listed separately, never as conflicts. a failed PR is cleaned up (`git cherry-pick --abort` / `git merge --abort`, whichever is in progress; nothing in progress is fine because `git pullreqs` already aborted) and the rest continue. If a cleanup fails it stops (exit 2). Then it prints an INTEGRATION SUMMARY (integrated PRs, conflicting PRs with their files and full description) and asks `Do you want to retry the conflicting PRs interactively? [y/N]`. On `y`, each one runs `git pullreqs -p N --leave-conflicts`, `git mergetool -y`, `git commit` (and `git cherry-pick --continue` for multi-commit cherry-picks); if that fails the PR is aborted and stays unfinished. It refuses to start with a cherry-pick/merge pending or uncommitted changes (exit 3). Exit codes: 0 all integrated, 1 some unfinished, 2 abort failed, 3 refused.
 
 For your own shell scripts, any stopped merge/cherry-pick/revert can be handled with:
 

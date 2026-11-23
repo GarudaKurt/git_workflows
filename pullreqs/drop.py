@@ -7,6 +7,8 @@
     git drop --all        list: also show PRs already promoted to main
     git drop --files      list: also show the files each PR changed
     git drop -1 --save DIR   keep the copy of the dropped PR(s) in DIR (default: inside .git)
+    git drop -5 ~/tmp/reports.txt   also APPEND the dropped PRs to that file, one line each:
+                                        PR# 24  [GarudaKurt] remove unnecessary print logs
 
 The number in `git drop -N` is a POSITION in the displayed list, not a PR ID:
 `git drop -3` removes positions 1, 2 and 3 whatever their PR numbers are.
@@ -21,6 +23,12 @@ for every dropped PR the list of files, a patch (PR-<n>.patch) and the files the
 as they were in that PR (files/PR-<n>/...).  Default place: <repo>/.git/pullreqs-dropped/
 <date-time>/ .   git drop --files lists the files of every picked PR without dropping.
 
+Report file: give a file path after -N (or --report FILE) and every dropped PR is appended to it as one line
+"PR# <number>  [<author>] <title>", after the drop worked.  --report-details writes a longer
+record with date and time, position, tested and merge commit and the files of each PR.
+Earlier contents are never overwritten, so the file becomes a history of drops.  The folder must exist; the
+path is checked before anything is changed.  Without a path no report is written.
+
 If origin/integrations holds the dropped PRs it is updated too, with
 --force-with-lease (it refuses if somebody else pushed in the meantime), so your next
 plain `git push` keeps working.  Use --no-push to leave origin alone.
@@ -34,7 +42,7 @@ from typing import List, Optional, Tuple
 
 from .integration import ensure_clean_worktree, ensure_integrations_branch, merge_pr
 from .staging import (StagingError, goto_toplevel, fetch, git, integrated_merges, integrations_branch, is_ancestor,
-                      pr_title, remote_name, remote_ref, rev, target_branch, target_ref, working_ref)
+                      pr_author, pr_title, remote_name, remote_ref, rev, target_branch, target_ref, working_ref)
 
 
 def _warn_remote_only(remote, remote_only) -> None:
@@ -121,6 +129,80 @@ def save_copy(dropped, dest_root: Optional[str], titles: bool) -> str:
     return folder
 
 
+def resolve_path(path: Optional[str]) -> Optional[str]:
+    """~ and relative paths are taken from the folder the command was started in (before it moves to the repo root)."""
+    return os.path.abspath(os.path.expanduser(path)) if path else None
+
+
+def check_report_path(path: str) -> None:
+    """Fail early, before anything is dropped, if the record could not be appended to `path`.  Creates nothing."""
+    folder = os.path.dirname(path)
+    if os.path.isdir(path):
+        raise StagingError("the report path {} is a folder. Give a file, e.g. {}".format(
+            path, os.path.join(path, "dropped-prs.txt")))
+    if not os.path.isdir(folder):
+        what = "is not a folder" if os.path.exists(folder) else "does not exist"
+        raise StagingError("the folder {} {}, so the report cannot be written there.\n"
+                           "Create it first (mkdir -p {}) or give another path. Nothing was changed."
+                           .format(folder, what, folder))
+    ok = os.access(path, os.W_OK) if os.path.exists(path) else os.access(folder, os.W_OK | os.X_OK)
+    if not ok:
+        raise StagingError("no permission to write the report {}. Nothing was changed.".format(path))
+
+
+def collect_records(dropped, titles: bool) -> list:
+    """Everything the report needs, read BEFORE the PRs are removed from the branch."""
+    records = []
+    for pos, (number, sha, short) in enumerate(dropped, 1):
+        tested = rev(sha + "^2")
+        title = (pr_title(number) or "") if titles else ""
+        author = (pr_author(number) or "") if titles else ""
+        if not title:                                   # no gh / offline: the commit says it too
+            title = git("log", "-1", "--format=%s", tested, check=False).stdout.strip()
+        if not author:
+            author = git("log", "-1", "--format=%an", tested, check=False).stdout.strip()
+        records.append({"position": pos, "number": number, "merge": sha, "tested": tested,
+                        "title": " ".join(title.split()), "author": author, "files": pr_files(sha)})
+    return records
+
+
+def format_report(records, branch: str, total: int, kept, when: datetime.datetime, details: bool = False) -> str:
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    if not details:
+        lines = ["PR# {}  [{}] {}".format(r["number"], r["author"], r["title"]) for r in records]
+        return "\n".join(lines) + "\n"
+    who = git("config", "user.name", check=False).stdout.strip()
+    lines = ["=" * 72,
+             "Dropped {} of {} trial-integrated PR(s) from {}   on {}{}".format(
+                 len(records), total, branch, stamp, "   by " + who if who else ""),
+             "Still integrated: {}".format(", ".join("#%d" % n for n, _, _ in kept) or "nothing"),
+             "-" * 72]
+    for r in records:
+        lines.append("PR# {}  [{}] {}".format(r["number"], r["author"], r["title"]))
+        lines.append("    position {}   tested commit {}   merge {}".format(r["position"], r["tested"][:10], r["merge"][:10]))
+        lines += ["      {}  {}".format(st, p) for st, p in r["files"]] or ["      (no file changes)"]
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def append_report(path: str, text: str, blank: bool = False) -> None:
+    """Append (never overwrite).  `blank`: keep one blank line between records (the long form)."""
+    try:
+        # the folder existed when the command started (check_report_path), but the rewrite can remove it
+        # when it only held files of a dropped PR (a report kept inside the repository)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        lead = ""
+        if os.path.exists(path) and os.path.getsize(path):
+            with open(path, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                ends_nl = f.read(1) == b"\n"
+                lead = ("\n" if blank else "") if ends_nl else ("\n\n" if blank else "\n")
+        with open(path, "a", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(lead + text)
+    except OSError as e:
+        raise StagingError("could not append to {}: {}".format(path, e.strerror or e))
+
+
 def list_prs(args) -> int:
     name, target = integrations_branch(), target_branch()
     if not args.no_fetch and not fetch():
@@ -186,6 +268,8 @@ def list_prs(args) -> int:
 def drop_first(args, count: int) -> int:
     name, target, remote = integrations_branch(), target_branch(), remote_name()
     goto_toplevel()
+    if args.report:
+        check_report_path(args.report)                 # before anything is changed
     ensure_clean_worktree()
     ensure_integrations_branch(create=False)           # fetches, switches, fast-forwards if behind
 
@@ -224,6 +308,8 @@ def drop_first(args, count: int) -> int:
     will_force = bool(published) and not args.no_push        # decided again after the rewrite
     if will_force:
         print("  origin: {} will be updated with --force-with-lease".format(published))
+    if args.report:
+        print("  Report: a record of the dropped PR(s) will be appended to {}".format(args.report))
     if args.dry_run:
         print("\nDry run: nothing was changed.")
         return 0
@@ -236,6 +322,7 @@ def drop_first(args, count: int) -> int:
         if sys.stdin.readline().strip().lower() not in ("y", "yes"):
             print("Aborted. Nothing was changed.")
             return 1
+    records = collect_records(dropped, titles=not args.no_titles) if args.report else None
     if not args.no_save:
         folder = save_copy(dropped, args.save, titles=not args.no_titles)
         print("\nSaved a copy of the dropped PR(s): {}".format(folder))
@@ -259,6 +346,15 @@ def drop_first(args, count: int) -> int:
     git("switch", name)
     git("reset", "--hard", new_tip)
     print("\n{} rewritten. Previous tip: {} (undo: git reset --hard {})".format(name, old_tip[:10], old_tip[:10]))
+    report_failed = False
+    if records is not None:
+        try:
+            append_report(args.report, format_report(records, name, len(merges), kept, datetime.datetime.now(), args.report_details),
+                          blank=args.report_details)
+            print("Recorded {} dropped PR(s) in {} (appended).".format(len(records), args.report))
+        except StagingError as error:                  # the drop itself worked: never undo it for a report
+            report_failed = True
+            print("git drop: the PR(s) were dropped, but the report was NOT written: {}".format(error), file=sys.stderr)
 
     if published and not is_ancestor(published, new_tip):
         if args.no_push:
@@ -272,7 +368,7 @@ def drop_first(args, count: int) -> int:
                       .format((r.stderr or r.stdout).strip(), name), file=sys.stderr)
                 return 2
             print("Updated {} (force-with-lease).".format(published))
-    return 0
+    return 3 if report_failed else 0
 
 
 def main(argv: List[str] = None) -> int:
@@ -280,6 +376,11 @@ def main(argv: List[str] = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("count", nargs="?", metavar="-N",
                    help="drop the first N PRs of the list, e.g. -3 (a position count, not a PR ID)")
+    p.add_argument("report_file", nargs="?", metavar="REPORT",
+                   help="drop: append a record of the dropped PR(s) to this file (never overwritten)")
+    p.add_argument("--report", metavar="FILE", help="same as the REPORT argument")
+    p.add_argument("--report-details", action="store_true",
+                   help="drop: in the report also write position, commits and files of each PR")
     p.add_argument("--all", action="store_true", help="list: also show PRs already in the target branch")
     p.add_argument("--no-fetch", action="store_true", help="list: do not fetch the remote first")
     p.add_argument("--no-titles", action="store_true", help="list: skip the PR title lookup (gh)")
@@ -292,6 +393,12 @@ def main(argv: List[str] = None) -> int:
     p.add_argument("--no-push", action="store_true", help="drop: do not update origin/integrations")
     args = p.parse_args(argv)
     try:
+        if args.report_file and args.report:
+            raise StagingError("give the report file once: either after -N or with --report")
+        if args.report_file and args.count is None:
+            raise StagingError("'{}' is not valid. Use a minus sign and a number: git drop -3 [REPORT]".format(args.report_file))
+        args.report = resolve_path(args.report or args.report_file)      # before the move to the repo root
+        args.save = resolve_path(args.save)
         if args.count is None:
             return list_prs(args)
         m = re.fullmatch(r"-(\d+)", args.count)

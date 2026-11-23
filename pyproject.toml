@@ -5,18 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "git-pullreqs"
 version = "0.1.0"
-description = "git pullreqs: adds stable custom PR IDs (1010+) on top of the native PR IDs"
+description = "QA workflow for GitHub pull requests: git pullreqs, git drop, git push-master, smartfix-mergetool"
 requires-python = ">=3.9"
 dependencies = []
-
-[project.optional-dependencies]
-dev = ["pytest"]
 
 [project.scripts]
 git-pullreqs = "pullreqs.cli:main"
 git-drop = "pullreqs.drop:main"
-smartfix-mergetool = "pullreqs.mergetool:main"
 git-push-master = "pullreqs.push_master:main"
+smartfix-mergetool = "pullreqs.mergetool:main"
 
 [tool.setuptools]
 packages = ["pullreqs"]

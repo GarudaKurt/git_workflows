@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 from .staging import (StagingError, development_branch, git, gh_available, integrated_merges,
                       integrations_branch, remote_ref, target_branch, target_ref, working_ref)
 
-PR_FIELDS = "number,title,author,state,baseRefName,headRefName,headRefOid,createdAt"
+PR_FIELDS = "number,title,author,state,baseRefName,headRefName,headRefOid,createdAt,url"
 
 
 # ---- data ---------------------------------------------------------------
@@ -58,6 +58,7 @@ def _load_prs(warnings: List[str]) -> List[dict]:
             "commit": (last.get("oid") or p.get("headRefOid") or "")[:7],
             "message": last.get("messageHeadline") or "",
             "created": (p.get("createdAt") or "")[:10],
+            "url": p.get("url") or "",
         })
     return sorted(prs, key=lambda x: -x["number"])
 
@@ -96,6 +97,8 @@ def _load_integration(by_number: Dict[int, dict], warnings: List[str]) -> dict:
             "message": tested[2],
             "merge": short,
             "status": status,
+            "closed": pr.get("state") == "CLOSED",
+            "open": pr.get("state") == "OPEN",
         })
     return {"exists": True, "rows": rows, "ref": ref}
 
@@ -109,7 +112,9 @@ def collect() -> dict:
     stage = {r["number"]: r["status"] for r in integration["rows"]}
     for p in prs:
         s = stage.get(p["number"])
-        if s == "main":
+        if p["state"] == "CLOSED" and s in ("pushed", "local"):
+            p["status"] = "declined"                      # closed on GitHub, but its merge is still in integrations
+        elif s == "main":
             p["status"] = "promoted"
         elif s == "pushed":
             p["status"] = "integrations"
@@ -244,7 +249,7 @@ code,.mono{font-family:var(--mono);font-size:12.5px}
 .st{display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;white-space:nowrap}
 .st.ready{background:var(--ready-bg);color:var(--ready)} .st.picked{background:var(--picked-bg);color:var(--picked)}
 .st.integrations{background:var(--integ-bg);color:var(--integ)} .st.promoted{background:var(--done-bg);color:var(--done)}
-.st.wrong-target{background:var(--bad-bg);color:var(--bad)} .st.merged,.st.closed{background:var(--grey-bg);color:var(--grey)}
+.st.wrong-target,.st.declined{background:var(--bad-bg);color:var(--bad)} .st.merged,.st.closed{background:var(--grey-bg);color:var(--grey)}
 .pos{display:inline-grid;place-items:center;min-width:28px;height:28px;border-radius:50%;background:var(--ink);color:var(--surface);font-weight:650;font-size:13px}
 tr.dropping td{background:var(--bad-bg)} tr.dropping .pos{background:var(--bad);color:#fff}
 tr.dropping td.title{text-decoration:line-through;text-decoration-color:var(--bad)}
@@ -253,12 +258,29 @@ tr.released td{opacity:.65}
 .sim{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;font-size:14px}
 .sim output{font-family:var(--mono);font-size:13px;background:var(--grey-bg);border-radius:6px;padding:3px 9px}
 .empty{color:var(--muted);padding:18px 4px;font-size:14px}
+.banner.info{background:var(--ready-bg);color:var(--ready);border:1px solid var(--ready)}
+.banner.ok{background:var(--done-bg);color:var(--done);border:1px solid var(--done)}
+.banner pre{margin:6px 0 0;white-space:pre-wrap;font-family:var(--mono);font-size:12.5px}
+td.acts{white-space:nowrap}
+.btn{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 9px;margin:0 4px 4px 0;font:inherit;font-size:12.5px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+.btn[disabled]{opacity:.6;cursor:progress}
+.btn.danger{color:var(--bad);border-color:var(--bad)} .btn.danger:hover{background:var(--bad-bg)}
+.btn.danger.solid{background:var(--bad);color:#fff;font-weight:600}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);padding:18px 20px;max-width:520px;width:calc(100% - 32px)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h2{margin:0 0 8px;font-size:17px} dialog p{margin:6px 0;font-size:14px}
+dialog textarea{width:100%;box-sizing:border-box;min-height:80px;margin:8px 0;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+dialog .row{display:flex;gap:8px;justify-content:flex-end}
+.here{display:inline-block;margin-left:6px;border-radius:999px;padding:1px 8px;font-size:11.5px;font-weight:600;background:var(--done-bg);color:var(--done)}
 .cmds{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:6px 24px;font-size:13px;color:var(--muted)}
 .cmds code{color:var(--ink)}
 @media (max-width:640px){.tile .n{font-size:26px} input[type=search]{margin-left:0;width:100%}}
 </style>
 </head>
 <body>
+<dialog id="decline-dlg" aria-labelledby="decline-title"></dialog>
 <div class="wrap">
   <header>
     <div>
@@ -282,10 +304,10 @@ tr.released td{opacity:.65}
 
   <section class="card" aria-labelledby="h-prs">
     <h2 id="h-prs">Pull requests</h2>
-    <p class="hint">Author, and the latest commit of each pull request (id and message).</p>
+    <p class="hint">Author, and the latest commit of each pull request (id and message). Open PRs can be checked out: copy the link or the command, or press Checkout when the report was started with <code>git pullreqs --report --serve</code>.</p>
     <div class="tools" id="tools"></div>
     <div class="scroll"><table id="prs">
-      <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th></tr></thead>
+      <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th><th>Checkout</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="empty" id="prs-empty" hidden>No pull requests match.</div>
@@ -296,7 +318,7 @@ tr.released td{opacity:.65}
     <p class="hint">Numbered in the order the PRs were picked. <code>git drop -N</code> removes the first N <em>positions</em>, not PR numbers.</p>
     <div class="sim" id="sim"></div>
     <div class="scroll"><table id="drops">
-      <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th></tr></thead>
+      <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="empty" id="drops-empty" hidden></div>
@@ -320,11 +342,11 @@ tr.released td{opacity:.65}
 (function () {
   "use strict";
   var D = JSON.parse(document.getElementById("data").textContent);
-  var B = D.branches, prs = D.prs, rows = D.integration.rows;
+  var B = D.branches, prs = D.prs, rows = D.integration.rows, LIVE = D.live || null;
   var STAGES = [
     ["ready", "Ready to pick", "--ready"], ["picked", "Picked, not pushed", "--picked"],
     ["integrations", "In integrations", "--integ"], ["promoted", "Promoted to main", "--done"],
-    ["wrong-target", "Wrong target branch", "--bad"], ["merged", "Merged", "--grey"], ["closed", "Closed", "--grey"]
+    ["declined", "Closed, still in integrations", "--bad"], ["wrong-target", "Wrong target branch", "--bad"], ["merged", "Merged", "--grey"], ["closed", "Closed", "--grey"]
   ];
   var LABEL = {}; STAGES.forEach(function (s) { LABEL[s[0]] = s[1]; });
 
@@ -347,6 +369,82 @@ tr.released td{opacity:.65}
   var banners = document.getElementById("banners");
   if (D.demo) banners.appendChild(el("div", "banner demo", "Sample data - this page only shows the layout. Run  git pullreqs --report  in your repository for real numbers."));
   D.warnings.forEach(function (w) { banners.appendChild(el("div", "banner warn", w)); });
+  var liveLine = el("div", "banner info"); liveLine.id = "live-line";
+  var statusBox = el("div", "banner"); statusBox.id = "live-status"; statusBox.setAttribute("role", "status"); statusBox.hidden = true;
+  function drawLiveLine() {
+    liveLine.textContent = LIVE
+      ? "Checkout is on: the Checkout buttons switch the branch of " + LIVE.path + "  (now on: " + (LIVE.branch || "detached HEAD") + ")"
+      : "This file is a snapshot, so it cannot run git. Use Copy link / Copy command, or start  git pullreqs --report --serve  to get working Checkout buttons.";
+  }
+  drawLiveLine(); banners.appendChild(liveLine); banners.appendChild(statusBox);
+  function say(kind, text) { statusBox.className = "banner " + kind; statusBox.textContent = text; statusBox.hidden = false; }
+  function prUrl(p) { return p.url || ("https://github.com/" + D.repo + "/pull/" + p.number); }
+  function copy(text, button, done) {
+    function flash() { var old = button.textContent; button.textContent = done; setTimeout(function () { button.textContent = old; }, 1400); }
+    function fallback() {
+      var t = document.createElement("textarea"); t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
+      document.body.appendChild(t); t.select();
+      var ok = false; try { ok = document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(t);
+      if (ok) flash(); else window.prompt("Copy this:", text);
+    }
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(flash, fallback); else fallback();
+  }
+  function btn(label, cls, onclick) { var b = el("button", "btn" + (cls ? " " + cls : ""), label); b.type = "button"; b.addEventListener("click", onclick); return b; }
+  function checkout(p, button) {
+    button.disabled = true; var old = button.textContent; button.textContent = "Checking out...";
+    fetch("/api/checkout", {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify({number: p.number})})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (res.j.branch !== undefined) LIVE.branch = res.j.branch;
+        drawLiveLine();
+        if (res.ok) say("ok", res.j.message); else say("warn", res.j.message || "Checkout failed");
+        drawPRs();
+      })
+      .catch(function () { say("warn", "Could not reach the report server. Is  git pullreqs --report --serve  still running?"); button.disabled = false; button.textContent = old; });
+  }
+
+  function flashNow() {
+    var m = null; try { m = sessionStorage.getItem("pullreqs-flash"); sessionStorage.removeItem("pullreqs-flash"); } catch (e) {}
+    if (m) say("ok", m);
+  }
+  flashNow();
+  function decline(p, position) {
+    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var h = el("h2", null, "Decline PR #" + p.number + "?"); h.id = "decline-title"; dlg.appendChild(h);
+    dlg.appendChild(el("p", null, p.title));
+    dlg.appendChild(el("p", null, "This closes the pull request on GitHub (like a reviewer declining it) and adds your reason as a comment."));
+    if (position) {
+      dlg.appendChild(el("p", "msg", "It is already picked into " + B.integrations + " at position " + position + ". Closing does not remove its merge from that branch. Afterwards run  git drop -" + position + "  (it removes positions 1-" + position + ", so re-pick the others with git pullreqs -p)."));
+    }
+    var ta = el("textarea"); ta.maxLength = 500; ta.placeholder = "Reason (optional)"; ta.setAttribute("aria-label", "Reason for declining"); dlg.appendChild(ta);
+    var err = el("p", "msg"); err.setAttribute("role", "alert"); dlg.appendChild(err);
+    var row = el("div", "row");
+    var cancel = btn("Cancel", "", function () { dlg.close(); });
+    var go = btn("Decline PR #" + p.number, "danger solid", function () {
+      go.disabled = true; go.textContent = "Declining...";
+      fetch("/api/decline", {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify({number: p.number, reason: ta.value})})
+        .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+        .then(function (res) {
+          if (res.ok) { try { sessionStorage.setItem("pullreqs-flash", res.j.message); } catch (e) {} location.reload(); }
+          else { err.textContent = res.j.message || "Decline failed"; go.disabled = false; go.textContent = "Decline PR #" + p.number; }
+        })
+        .catch(function () { err.textContent = "Could not reach the report server."; go.disabled = false; go.textContent = "Decline PR #" + p.number; });
+    });
+    row.appendChild(cancel); row.appendChild(go); dlg.appendChild(row);
+    dlg.showModal();
+  }
+  function reopen(p, button) {
+    button.disabled = true; button.textContent = "Reopening...";
+    fetch("/api/reopen", {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify({number: p.number})})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (res.ok) { try { sessionStorage.setItem("pullreqs-flash", res.j.message); } catch (e) {} location.reload(); }
+        else { say("warn", res.j.message || "Reopen failed"); button.disabled = false; button.textContent = "Reopen"; }
+      })
+      .catch(function () { say("warn", "Could not reach the report server."); button.disabled = false; button.textContent = "Reopen"; });
+  }
+  function positionOf(number) { var r = rows.filter(function (x) { return x.number === number && x.position !== null; })[0]; return r ? r.position : null; }
 
   // tiles
   var pending = rows.filter(function (r) { return r.position !== null; });
@@ -414,6 +512,29 @@ tr.released td{opacity:.65}
       var br = el("td"); br.appendChild(el("code", null, p.head)); br.appendChild(el("span", "msg", "→ " + p.base)); tr.appendChild(br);
       var cm = el("td"); cm.appendChild(sha(p.commit)); cm.appendChild(el("span", "msg", p.message || "-")); tr.appendChild(cm);
       var st = el("td"); st.appendChild(el("span", "st " + p.status, LABEL[p.status] || p.status)); tr.appendChild(st);
+      var ac = el("td", "acts");
+      if (p.state === "OPEN") {
+        var lk = btn("Copy link", "", function () { copy(prUrl(p), lk, "Copied"); });
+        var cm2 = btn("Copy command", "", function () { copy("gh pr checkout " + p.number, cm2, "Copied"); });
+        lk.title = prUrl(p); cm2.title = "gh pr checkout " + p.number;
+        ac.appendChild(lk); ac.appendChild(cm2);
+        if (LIVE) {
+          var co = btn("Checkout", "primary", function () { checkout(p, co); });
+          co.title = "Switch " + LIVE.path + " to " + p.head;
+          ac.appendChild(co);
+          if (LIVE.branch && LIVE.branch === p.head) ac.appendChild(el("span", "here", "checked out"));
+          if (p.status !== "promoted") {
+            var dc = btn("Decline", "danger", function () { decline(p, positionOf(p.number)); });
+            dc.title = "Close PR #" + p.number + " on GitHub";
+            ac.appendChild(dc);
+          }
+        }
+      } else if (p.state === "CLOSED" && LIVE) {
+        var ro = btn("Reopen", "primary", function () { reopen(p, ro); });
+        ro.title = "Reopen PR #" + p.number + " on GitHub (undo the decline)";
+        ac.appendChild(ro);
+      } else ac.appendChild(el("span", "msg", "-"));
+      tr.appendChild(ac);
       tb.appendChild(tr);
     });
     document.getElementById("prs-empty").hidden = shown.length > 0;
@@ -447,7 +568,19 @@ tr.released td{opacity:.65}
       var s = el("td");
       var cls = r.status === "main" ? "promoted" : (r.status === "pushed" ? "integrations" : "picked");
       var txt = r.status === "main" ? "In " + B.main : (r.status === "pushed" ? "Pushed" : "Local only");
-      s.appendChild(el("span", "st " + cls, txt)); tr.appendChild(s);
+      s.appendChild(el("span", "st " + cls, txt));
+      if (r.closed) s.appendChild(el("span", "st declined", "declined"));
+      tr.appendChild(s);
+      var a = el("td", "acts");
+      if (LIVE && r.open && r.status !== "main") {
+        var d2 = btn("Decline", "danger", function () { decline({number: r.number, title: r.title}, r.position); });
+        a.appendChild(d2);
+      }
+      if (LIVE && r.closed) {
+        var r2 = btn("Reopen", "primary", function () { reopen({number: r.number}, r2); });
+        a.appendChild(r2);
+      }
+      tr.appendChild(a);
       tb.appendChild(tr);
     });
     if (!pending.length) out.textContent = "";

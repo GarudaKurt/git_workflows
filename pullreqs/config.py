@@ -24,16 +24,11 @@ class Config:
 
 
 def load_config() -> Config:
-    list_cmd = git_config("pullreqs.listCommand")
-    if not list_cmd:
-        raise PullreqsError(
-            "pullreqs.listCommand is not set. Point it at the EXISTING command, e.g.\n"
-            "  git config --global pullreqs.listCommand '/path/to/original/git-pullreqs --oneline'"
-        )
+    list_cmd = git_config("pullreqs.listCommand")      # optional: without it the open PRs come from `gh pr list`
     show = git_config("pullreqs.showCommand")
     create = git_config("pullreqs.createCommand")
     return Config(
-        list_cmd=shlex.split(list_cmd),
+        list_cmd=shlex.split(list_cmd) if list_cmd else [],
         show_cmd=shlex.split(show) if show else None,
         create_cmd=shlex.split(create) if create else None,
         create_id_regex=git_config("pullreqs.createIdRegex", r"(\d{4,})"),

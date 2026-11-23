@@ -30,14 +30,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-resolve", action="store_true",
                    help="with -p: do not try the automatic conflict algorithm; abort a conflicting PR at once")
     p.add_argument("--stop-on-conflict", action="store_true",
-                   help="with -p: stop at the first PR that fails, without asking")
+                   help="with -p: abort the run at the first conflicting PR, without asking")
     p.add_argument("--continue-on-conflict", action="store_true",
-                   help="with -p: carry on with the other PRs after a failure, without asking "
-                        "(default at a terminal: ask; without a terminal: carry on)")
+                   help="with -p: pause every conflicting PR and carry on, without asking "
+                        "(default at a terminal: ask what to do; without a terminal: pause and carry on)")
     p.add_argument("--leave-conflicts", action="store_true",
                    help="with -p: when the algorithm cannot fix a PR, leave the merge in progress (what it could "
                         "fix is staged) for git mergetool / git commit, instead of aborting. Stops there")
+    p.add_argument("--brief", action="store_true",
+                   help="with -p: no summary or footer (for scripts that print their own report)")
     p.add_argument("--status-file", metavar="FILE", help="with -p: also write the per-PR result as JSON")
+    p.add_argument("--serve", action="store_true",
+                   help="with --report: serve the report on 127.0.0.1 so its Checkout buttons switch branches "
+                        "in this repository (Ctrl+C to stop)")
+    p.add_argument("--port", type=int, default=8765, metavar="N", help="with --serve: port (default 8765; 0 = any free port)")
+    p.add_argument("--open", action="store_true", dest="open_browser", help="with --serve: open the page in a browser")
     p.add_argument("-o", "--output", default="pullreqs-report.html", metavar="FILE",
                    help="with --report: the file to write (default: pullreqs-report.html)")
     p.add_argument("-t", "--title", metavar="TITLE", help="with --create: the PR title (default: from your commits)")
@@ -74,9 +81,19 @@ def _picked_marks() -> Dict[int, str]:
 
 
 def cmd_oneline(provider, store):
-    ids = _load_map(store)
+    # the 1010+ custom IDs only exist for setups that configured pullreqs.listCommand
+    ids = _load_map(store) if provider.cfg.list_cmd else {}
     marks = _picked_marks()
-    for pr in provider.list():
+    prs = provider.list()
+    if not prs:
+        if provider.cfg.list_cmd:
+            src = "pullreqs.listCommand ({})".format(" ".join(provider.cfg.list_cmd))
+        else:
+            from .provider import remote_repo
+            src = "GitHub repository {} (gh pr list)".format(remote_repo(provider.cfg.remote) or "of this folder")
+        print("No open pull requests from {}.\nIf you expect some: gh auth status, and  git config --show-origin "
+              "--get-regexp '^pullreqs'".format(src), file=sys.stderr)
+    for pr in prs:
         custom = ids.get(pr.native_id)
         mark = marks.get(int(pr.native_id)) if pr.native_id.isdigit() else None
         suffix = "  <- {}".format(mark) if mark else ""
@@ -96,7 +113,10 @@ def cmd_pick(tokens: List[str], args=None) -> int:
                     stop_on_conflict=bool(args and args.stop_on_conflict),
                     ask=not (args and args.continue_on_conflict),
                     leave_conflicts=bool(args and args.leave_conflicts),
+                    brief=bool(args and args.brief),
                     status_file=args.status_file if args else None)
+    if args and args.brief:
+        return rep.exit_code
     merged, skipped, name = rep.merged, rep.skipped, integrations_branch()
     print("\nPicked into {}: {}".format(name, ", ".join("#%d" % n for n in merged) or "nothing new"))
     if skipped:
@@ -118,6 +138,7 @@ def cmd_report(output: str):
     win = windows_path(path)
     if win:
         print("Open it in Windows: {}".format(win))
+    print("Working Checkout buttons need the live version:  git pullreqs --report --serve")
 
 
 def cmd_sync(provider, store):
@@ -144,6 +165,11 @@ def main(argv=None) -> int:
             raise PullreqsError(f"unrecognized arguments: {' '.join(extra)}")
         if args.pick is not None:
             return cmd_pick(args.pick, args)
+        if (args.serve or args.open_browser) and not args.report:
+            raise PullreqsError("--serve and --open belong to --report:  git pullreqs --report --serve")
+        if args.report and args.serve:
+            from .serve import serve
+            return serve(args.port, args.open_browser)
         if args.report:
             cmd_report(args.output)
             return 0

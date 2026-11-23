@@ -146,15 +146,20 @@ def gh_available() -> bool:
 
 
 def pr_info(number: int) -> Optional[dict]:
-    """{'state', 'baseRefName', 'title'} of a PR, or None if gh cannot answer."""
+    """{'state', 'baseRefName', 'title', 'author': {'login'}} of a PR, or None if gh cannot answer."""
     if not gh_available():
         return None
     try:
-        r = subprocess.run(["gh", "pr", "view", str(number), "--json", "state,baseRefName,title"],
+        r = subprocess.run(["gh", "pr", "view", str(number), "--json", "state,baseRefName,title,author"],
                            text=True, capture_output=True, timeout=20)
         return json.loads(r.stdout) if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, ValueError):
         return None
+
+
+def pr_author(number: int) -> Optional[str]:
+    info = pr_info(number)
+    return ((info.get("author") or {}).get("login") or None) if info else None
 
 
 def pr_title(number: int) -> Optional[str]:
