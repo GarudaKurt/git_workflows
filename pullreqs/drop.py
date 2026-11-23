@@ -40,6 +40,7 @@ import re
 import sys
 from typing import List, Optional, Tuple
 
+from . import audit
 from .integration import ensure_clean_worktree, ensure_integrations_branch, merge_pr
 from .staging import (StagingError, goto_toplevel, fetch, git, integrated_merges, integrations_branch, is_ancestor,
                       pr_author, pr_title, remote_name, remote_ref, rev, target_branch, target_ref, working_ref)
@@ -334,6 +335,8 @@ def drop_first(args, count: int) -> int:
             o = merge_pr(number, sha + "^2")
             if not o.ok:
                 why = "; ".join("{} ({})".format(f, o.reasons.get(f, "conflict")) for f in o.files) or o.detail
+                audit.record("drop_failed", number, branch=name, reason=args.reason, dropped=[n for n, _, _ in dropped],
+                             why=why)
                 raise StagingError(
                     "FAILURE: PR #{} no longer merges cleanly without the dropped PR(s): {}\n"
                     "The merge was aborted ({}) and nothing was changed ({} is as before). "
@@ -346,6 +349,11 @@ def drop_first(args, count: int) -> int:
     git("switch", name)
     git("reset", "--hard", new_tip)
     print("\n{} rewritten. Previous tip: {} (undo: git reset --hard {})".format(name, old_tip[:10], old_tip[:10]))
+    for position, (number, sha, _) in enumerate(dropped, 1):
+        audit.record("drop", number, branch=name, position=position, merge=sha[:10], reason=args.reason,
+                     dropped_together=[n for n, _, _ in dropped if n != number],
+                     kept=[n for n, _, _ in kept], old_tip=old_tip[:10], new_tip=new_tip[:10],
+                     report=args.report, saved_copy=None if args.no_save else folder)
     report_failed = False
     if records is not None:
         try:
@@ -391,6 +399,7 @@ def main(argv: List[str] = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="drop: show the plan only")
     p.add_argument("-y", "--yes", action="store_true", help="drop: do not ask for confirmation")
     p.add_argument("--no-push", action="store_true", help="drop: do not update origin/integrations")
+    p.add_argument("-r", "--reason", metavar="TEXT", help="drop: why (kept in the audit log, git pullreqs --audit)")
     args = p.parse_args(argv)
     try:
         if args.report_file and args.report:

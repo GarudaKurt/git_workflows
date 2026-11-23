@@ -27,6 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "(extra args after `--` go to `gh pr create`)")
     g.add_argument("--report", action="store_true",
                    help="write an HTML dashboard: PR counts, authors, latest commits and the drop list")
+    g.add_argument("--audit", action="store_true",
+                   help="show the audit log (who picked, dropped, promoted, declined or reopened which PR, and why)")
+    p.add_argument("--pr", type=int, metavar="N", help="with --audit: only this PR")
+    p.add_argument("--action", metavar="NAME", help="with --audit: only this action (pick, drop, promote, decline, ...)")
+    p.add_argument("--since", metavar="DATE", help="with --audit: only entries from this date on (2026-11-01)")
+    p.add_argument("--user", metavar="TEXT", help="with --audit: only entries whose user contains TEXT")
+    p.add_argument("--last", type=int, metavar="N", help="with --audit: only the last N entries")
+    p.add_argument("--json", action="store_true", help="with --audit: raw JSON lines")
     p.add_argument("--no-auto-resolve", action="store_true",
                    help="with -p: do not try the automatic conflict algorithm; abort a conflicting PR at once")
     p.add_argument("--stop-on-conflict", action="store_true",
@@ -115,6 +123,7 @@ def cmd_pick(tokens: List[str], args=None) -> int:
                     leave_conflicts=bool(args and args.leave_conflicts),
                     brief=bool(args and args.brief),
                     status_file=args.status_file if args else None)
+    log_pick(rep)
     if args and args.brief:
         return rep.exit_code
     merged, skipped, name = rep.merged, rep.skipped, integrations_branch()
@@ -126,6 +135,18 @@ def cmd_pick(tokens: List[str], args=None) -> int:
     print("  git drop                         numbered list of what is picked")
     print("  git drop -N                      drop the first N of that list")
     return rep.exit_code
+
+
+def log_pick(rep) -> None:
+    """One audit entry per PR that was merged or that could not be."""
+    from . import audit
+    for o in rep.outcomes:
+        if o.status in ("merged", "resolved"):
+            audit.record("pick", o.number, branch=rep.branch, result=o.status, auto_resolved=o.files)
+        elif o.status in ("failed", "error"):
+            audit.record("pick_failed", o.number, branch=rep.branch, result=o.status, files=o.files,
+                         why=["{}: {}".format(f, r) for f, r in o.reasons.items()], detail=o.detail,
+                         paused=o.held, fixed_by_hand=o.manual)
 
 
 def cmd_report(output: str):
@@ -165,6 +186,12 @@ def main(argv=None) -> int:
             raise PullreqsError(f"unrecognized arguments: {' '.join(extra)}")
         if args.pick is not None:
             return cmd_pick(args.pick, args)
+        if args.audit:
+            from . import audit
+            try:
+                return audit.show(args.pr, args.action, args.since, args.user, args.last, args.json)
+            except ValueError as e:
+                raise PullreqsError(str(e))
         if (args.serve or args.open_browser) and not args.report:
             raise PullreqsError("--serve and --open belong to --report:  git pullreqs --report --serve")
         if args.report and args.serve:

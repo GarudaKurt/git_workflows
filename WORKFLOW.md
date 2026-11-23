@@ -164,3 +164,28 @@ Exit `0` = conflicts fixed and the operation continued, `1` = aborted cleanly, `
 * A conflict while picking never leaves a half-done merge: see "Conflicts while picking" above.
 * Undo a rewrite: `git drop` prints the previous tip: `git reset --hard <sha>`.
 * `git drop` and `-p` show PR titles when `gh` is installed and logged in.
+
+## Audit log
+
+Every action that changes what goes to `main` is recorded in an append-only file, one JSON line per event, so "why was #24 removed, and by whom?" always has an answer:
+
+| action | written by | useful fields |
+|---|---|---|
+| `pick` / `pick_failed` | `git pullreqs -p` | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
+| `drop` / `drop_failed` | `git drop -N` | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
+| `promote` / `promote_failed` | `git push-master` | promotion PR number, message, PRs promoted together, why it failed |
+| `decline`, `reopen`, `checkout` | the live report | reason, title, author, position in integrations |
+
+Each line also has the time (with UTC offset), the user (`user.name <user.email>`), the branch and `via` (`cli` or `report`).
+
+```bash
+git drop -2 --reason "PR #24 breaks login"      # -r TEXT: the reason goes into the audit log
+git pullreqs --audit                            # everything, oldest first
+git pullreqs --audit --pr 24                    # the history of one PR
+git pullreqs --audit --action drop --since 2026-11-01 --last 10
+git pullreqs --audit --user ana --json          # raw lines, for scripts
+```
+
+- **Where:** `<repo>/.git/pullreqs-audit.log` by default (never committed). Point every integrator at one file with `git config pullreqs.auditLog /shared/folder/audit.log`. Lines are appended with a single write, so two runs at once do not mix lines. Switch it off with `git config pullreqs.audit off`.
+- **It never breaks a command:** if the file cannot be written, the command still finishes and one warning is printed.
+- **What is not recorded:** a plain `git push` of `integrations` (it is not one of these commands), and anything done outside them. Edit or delete the file and the history is gone: it is a record for the team, not tamper-proof; keep it in a folder only integrators can write to if that matters.

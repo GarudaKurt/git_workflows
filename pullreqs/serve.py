@@ -26,7 +26,7 @@ import time
 import webbrowser
 from typing import Callable, Dict, Optional, Tuple
 
-from . import report
+from . import audit, report
 from .staging import StagingError, git, gh_available, goto_toplevel
 
 CACHE_SECONDS = 15
@@ -82,6 +82,7 @@ class Session:
             now = current_branch()
             if not ok:
                 return 500, {"ok": False, "message": message, "branch": now}
+            audit.record("checkout", number, via="report", branch=now, previous=before)
             return 200, {"ok": True, "branch": now, "previous": before, "number": number,
                          "message": "Checked out {} (PR #{}) in {}".format(now, number, self.root)}
 
@@ -102,6 +103,9 @@ class Session:
             ok, message = _close_pr(number, comment)
             if not ok:
                 return 500, {"ok": False, "message": message}
+            audit.record("decline", number, via="report", reason=reason, title=pr.get("title"), author=pr.get("author"),
+                         picked_position=next((r["position"] for r in self.data(max_age=3600)["integration"]["rows"]
+                                               if r["number"] == number and r.get("position") is not None), None))
             self.data(max_age=0)                                   # refresh so the reload shows it as closed
             return 200, {"ok": True, "number": number, "message": "PR #{} declined (closed).".format(number)}
 
@@ -118,6 +122,7 @@ class Session:
             ok, message = _reopen_pr(number, "Reopened via git pullreqs report.")
             if not ok:
                 return 500, {"ok": False, "message": message}
+            audit.record("reopen", number, via="report", title=pr.get("title"))
             self.data(max_age=0)
             return 200, {"ok": True, "number": number, "message": "PR #{} reopened.".format(number)}
 

@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 
+from . import audit
 from .staging import (StagingError, development_branch, fetch, git, integrated_merges, integrated_prs, integrations_branch,
                       local_branch_exists, pr_title, remote_name, remote_ref, rev, target_branch,
                       target_ref)
@@ -172,8 +173,14 @@ def run(args) -> int:
         print("\nThe pull request was NOT merged:\n  {}".format((r.stderr or r.stdout).strip()), file=sys.stderr)
         print("It is open at {}\nMerge it there (approvals or checks may be required), "
               "then run: git drop".format(url), file=sys.stderr)
+        for n, _short in pending:
+            audit.record("promote_failed", n, branch=name, target=target, promotion_pr=number, url=url, message=message,
+                         why=(r.stderr or r.stdout).strip()[-300:])
         return 2
 
+    for n, _short in pending:
+        audit.record("promote", n, branch=name, target=target, promotion_pr=number, url=url, message=message,
+                     promoted_together=[m for m, _ in pending if m != n])
     fetch()
     left = integrated_prs(source, not_in=tref)
     print("\nDone. {} PR(s) are now in {}.".format(len(pending), target))
