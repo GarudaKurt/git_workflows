@@ -135,6 +135,39 @@ class Session:
                     ", ".join("PR #%d" % n for n in declined))}
             return self._basket(basket.ship)
 
+    def deploy(self, message: str) -> Tuple[int, dict]:
+        """git push-master -m MESSAGE --yes: promote what is on origin/integrations into main."""
+        with self.lock:
+            if not message:
+                return 400, {"ok": False, "message": "The commit message must not be empty."}
+            rows = self.data(max_age=0)["integration"]["rows"]
+            pushed = [r for r in rows if r["status"] == "pushed"]
+            if not pushed:
+                return 409, {"ok": False, "message": "Nothing to deploy: no PR is waiting in origin/{}.".format(
+                    self.data()["branches"]["integrations"])}
+            waiting = [r["number"] for r in rows if r["status"] == "local"]
+            if waiting:
+                return 409, {"ok": False, "message": "{} picked but not shipped yet. Ship (or drop) them first: Deploy "
+                                                       "promotes exactly what is on origin.".format(
+                                                           ", ".join("PR #%d" % n for n in waiting))}
+            declined = [r["number"] for r in pushed if r.get("closed")]
+            if declined:
+                return 409, {"ok": False, "message": "{} was declined (closed). Drop it before deploying.".format(
+                    ", ".join("PR #%d" % n for n in declined))}
+            if not gh_available():
+                return 409, {"ok": False, "message": "gh is not installed or not logged in (gh auth login): "
+                                                       "promoting goes through a pull request."}
+            busy = self._busy()
+            if busy:
+                return busy
+            ok, text = _push_master(message, self.root)
+            self.data(max_age=0)
+            numbers = ", ".join("#%d" % r["number"] for r in pushed)
+            if ok:
+                return 200, {"ok": True, "output": text,
+                             "message": "Deployed {} to {}: {}".format(numbers, self.data()["branches"]["main"], message)}
+            return 500, {"ok": False, "output": text, "message": text.strip()[-600:] or "git push-master failed"}
+
     def decline(self, number: int, reason: str) -> Tuple[int, dict]:
         """(http status, json) for 'decline (close) PR number' on GitHub, with an optional reason as a comment."""
         with self.lock:
@@ -186,6 +219,15 @@ def _reopen_pr(number: int, comment: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def _push_master(message: str, root: str) -> Tuple[bool, str]:
+    """Run git push-master as its own process (list arguments, no shell); (ok, its output)."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))               # the folder that holds pullreqs/
+    env = dict(os.environ, PULLREQS_VIA="report", PYTHONPATH=os.pathsep.join(filter(None, [here, os.environ.get("PYTHONPATH")])))
+    r = subprocess.run([sys.executable, "-m", "pullreqs.push_master", "--message=" + message, "--yes"],
+                       cwd=root, env=env, text=True, capture_output=True, timeout=600)
+    return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
 def _close_pr(number: int, comment: str) -> Tuple[bool, str]:
     """gh pr close N --comment ...  (the API is needed to close a PR, there is no git fallback)."""
     if not gh_available():
@@ -225,7 +267,7 @@ def _checkout_with_git(number: int, head: str) -> Tuple[bool, str]:
     return (True, "") if r.returncode == 0 else (False, "git switch {} failed: {}".format(branch, (r.stderr or r.stdout).strip()[-300:]))
 
 
-ROUTES = ("/api/checkout", "/api/decline", "/api/reopen", "/api/pick", "/api/unpick", "/api/ship")
+ROUTES = ("/api/checkout", "/api/decline", "/api/reopen", "/api/pick", "/api/unpick", "/api/ship", "/api/deploy")
 
 
 def make_handler(session: Session):
@@ -281,14 +323,18 @@ def make_handler(session: Session):
                 if not isinstance(body, dict):
                     raise ValueError
                 number = body.get("number")
-                if self.path == "/api/ship":
-                    number = 0                                      # ship has no PR number
+                if self.path in ("/api/ship", "/api/deploy"):
+                    number = 0                                      # these have no PR number
                 elif not isinstance(number, int) or isinstance(number, bool) or number <= 0:
                     raise ValueError
                 reason = body.get("reason", "")
                 if not isinstance(reason, str) or len(reason) > 500:
                     return self._json(400, {"ok": False, "message": "reason must be text of at most 500 characters"})
                 reason = "".join(c for c in reason if c in "\n" or c.isprintable()).strip()
+                message = body.get("message", "")
+                if not isinstance(message, str) or len(message) > 200:
+                    return self._json(400, {"ok": False, "message": "message must be text of at most 200 characters"})
+                message = " ".join("".join(c if c.isprintable() else " " for c in message).split())     # one line
             except (ValueError, AttributeError, UnicodeDecodeError):
                 return self._json(400, {"ok": False, "message": "expected JSON like {\"number\": 38}"})
             try:
@@ -302,6 +348,8 @@ def make_handler(session: Session):
                     status, payload = session.unpick(number, reason)
                 elif self.path == "/api/ship":
                     status, payload = session.ship()
+                elif self.path == "/api/deploy":
+                    status, payload = session.deploy(message)
                 else:
                     status, payload = session.checkout(number)
             except subprocess.TimeoutExpired:

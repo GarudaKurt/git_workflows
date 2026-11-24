@@ -215,6 +215,11 @@ The manual steps can all be done in the live report (`git pullreqs --report --se
 | **Pick** | PR table, PRs that are *Ready to pick* | `git pullreqs -p N` | merges the PR into your local `integrations` branch (conflicts are resolved automatically when possible; otherwise nothing changes and a **conflict window** opens: the conflicting files, why, which already-picked PR also changed each one, what you can do (drop that PR first, resolve in a terminal, or decline the PR with the conflict filled in as the reason). **Nothing is pushed.** |
 | **Drop** | *Drops* table, PRs that are *Local only* | `git drop` (for unpushed picks) | removes that one PR from the picks. The branch is rebuilt off to the side and the PRs picked after it are merged again on top; if one of them no longer merges, nothing is changed. The PR stays open on GitHub (use **Decline** to reject it too). |
 | **Ship N PRs** | bar above the *Drops* table, shown while picks are waiting | `git push` | pushes `integrations` to origin after a confirmation. A normal push, never forced. Refused when a waiting PR was declined, or when the branch diverged from origin. |
+| **Deploy to main** | green bar under the Ship bar, shown while PRs are on origin and not in `main` yet | `git push-master -m "msg"` | opens a window listing the PRs and asking for the **commit message** (required, one line, up to 200 characters). Confirming runs `git push-master` for you: a pull request `integrations` -> `main` merged with a merge commit using your message, then `main` is merged back into `development` and the picked PRs are closed. Disabled while picks are unshipped (ship or drop them first) or a PR was declined (drop it). If GitHub does not allow the merge yet (checks, approvals) the window shows GitHub's answer and the PR stays open. |
+
+When the deploy is done a **"Deployed to main"** window opens: the PRs that were promoted, the commit message, a link to the promotion pull request, anything that needs your attention (for example the sync back into `development` could not be merged) and the full output under *Details*. Pressing **Done** (or Esc) reloads the report so the lists are current.
+
+**Pagination.** The *Pull requests* table shows **10 PRs per page** by default; the *Per page* menu offers 10, 15, 20 or **All**, with **Prev** / **Next** and *Showing 11-20 of 23*. Filters and search apply to the whole list first, then it is paged; changing the filter, the search or the page size starts at page 1. The size and page are remembered while the tab is open, so a Pick that reloads the page keeps you where you were. The *Drops: the trial integration* table has the same pager (its own size and page); the `git drop -N` simulator still counts every position, whichever page is shown. Pagination also works in a saved `.html` snapshot.
 
 Notes:
 - Pick, Drop and Ship need a clean working tree and no merge in progress; the message tells you what to fix. Pick switches your workspace to the `integrations` branch.
@@ -232,7 +237,7 @@ Every action that changes what goes to `main` is recorded in an append-only file
 | `pick` / `pick_failed` | `git pullreqs -p`, report **Pick** | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
 | `drop` / `drop_failed` | `git drop -N`, report **Drop** | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
 | `ship` / `ship_failed` | report **Ship** | merge, tip, PRs shipped together, why it was rejected |
-| `promote` / `promote_failed` | `git push-master` | promotion PR number, message, PRs promoted together, why it failed |
+| `promote` / `promote_failed` | `git push-master`, report **Deploy** | promotion PR number, message, PRs promoted together, why it failed |
 | `decline`, `reopen`, `checkout` | the live report | reason, title, author, position in integrations |
 
 Each line also has the time (with UTC offset), the user (`user.name <user.email>`), the branch and `via` (`cli` or `report`).

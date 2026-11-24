@@ -26,6 +26,7 @@ has the promotion commit and GitHub marks the picked PRs as merged (skip it with
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -174,12 +175,12 @@ def run(args) -> int:
         print("It is open at {}\nMerge it there (approvals or checks may be required), "
               "then run: git drop".format(url), file=sys.stderr)
         for n, _short in pending:
-            audit.record("promote_failed", n, branch=name, target=target, promotion_pr=number, url=url, message=message,
+            audit.record("promote_failed", n, via=os.environ.get("PULLREQS_VIA", "cli"), branch=name, target=target, promotion_pr=number, url=url, message=message,
                          why=(r.stderr or r.stdout).strip()[-300:])
         return 2
 
     for n, _short in pending:
-        audit.record("promote", n, branch=name, target=target, promotion_pr=number, url=url, message=message,
+        audit.record("promote", n, via=os.environ.get("PULLREQS_VIA", "cli"), branch=name, target=target, promotion_pr=number, url=url, message=message,
                      promoted_together=[m for m, _ in pending if m != n])
     fetch()
     left = integrated_prs(source, not_in=tref)

@@ -268,6 +268,15 @@ td.acts{white-space:nowrap}
 .btn[disabled]{opacity:.6;cursor:progress}
 .ship{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 12px;padding:10px 12px;border:1px solid var(--picked);background:var(--picked-bg);color:var(--picked);border-radius:8px;font-size:14px}
 .ship[hidden]{display:none}
+.ship.deploy{border-color:var(--ok,#1a7f37);background:var(--ok-bg,#e6f4ea);color:var(--ok,#1a7f37)}
+.btn.deploy-go{background:#1a7f37;color:#fff;border-color:#1a7f37;font-weight:600}
+dialog .msg,dialog p{white-space:pre-wrap}
+dialog .done-line{color:var(--ok,#1a7f37);font-weight:600}
+dialog details{margin:8px 0;font-size:13px} dialog pre{max-height:220px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;white-space:pre-wrap;word-break:break-word;font-size:12px}
+.pager{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;font-size:13px;color:var(--muted,#667085)}
+.pager .grp{display:flex;align-items:center;gap:8px}
+.pager select{font:inherit;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
+dialog input[type=text]{width:100%;box-sizing:border-box;margin:8px 0;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:7px}
 .ship .grow{flex:1;min-width:200px}
 .btn.ship-go{background:var(--ready);color:#fff;border-color:var(--ready);font-weight:600}
 .btn.danger{color:var(--bad);border-color:var(--bad)} .btn.danger:hover{background:var(--bad-bg)}
@@ -314,6 +323,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th><th>Checkout</th></tr></thead>
       <tbody></tbody>
     </table></div>
+    <div class="pager" id="pager" hidden></div>
     <div class="empty" id="prs-empty" hidden>No pull requests match.</div>
   </section>
 
@@ -321,11 +331,13 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     <h2 id="h-drop">Drops: the trial integration <span class="sub" style="font-weight:400">(what <code>git drop</code> lists)</span></h2>
     <p class="hint">Numbered in the order the PRs were picked. <code>git drop -N</code> removes the first N <em>positions</em>, not PR numbers.</p>
     <div class="ship" id="ship" hidden></div>
+    <div class="ship deploy" id="deploy" hidden></div>
     <div class="sim" id="sim"></div>
     <div class="scroll"><table id="drops">
       <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
+    <div class="pager" id="pager-drops" hidden></div>
     <div class="empty" id="drops-empty" hidden></div>
   </section>
 
@@ -415,7 +427,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   }
   flashNow();
   function decline(p, position, prefill) {
-    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var dlg = freshDialog();
     var h = el("h2", null, "Decline PR #" + p.number + "?"); h.id = "decline-title"; dlg.appendChild(h);
     dlg.appendChild(el("p", null, p.title));
     dlg.appendChild(el("p", null, "This closes the pull request on GitHub (like a reviewer declining it) and adds your reason as a comment."));
@@ -450,6 +462,9 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       })
       .catch(function () { say("warn", "Could not reach the report server."); button.disabled = false; button.textContent = "Reopen"; });
   }
+  function freshDialog() {
+    var dlg = document.getElementById("decline-dlg"); dlg.textContent = ""; dlg.onclose = null; return dlg;
+  }
   // a POST that ends with a flash message after the reload (Pick, Drop, Ship)
   function post(url, payload, button, busy, again, fail) {
     var label = button.textContent; button.disabled = true; button.textContent = busy;
@@ -457,7 +472,8 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     fetch(url, {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify(payload)})
       .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
       .then(function (res) {
-        if (res.ok) { try { sessionStorage.setItem("pullreqs-flash", res.j.message); } catch (e) {} location.reload(); }
+        if (res.ok && again) again(res.j);
+        else if (res.ok) { try { sessionStorage.setItem("pullreqs-flash", res.j.message); } catch (e) {} location.reload(); }
         else undo(res.j.message || "failed", res.j);
       })
       .catch(function () { undo("Could not reach the report server."); });
@@ -469,7 +485,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   }
   // the PR conflicts: say what, where it comes from, what was left untouched, and what to do next
   function conflictDialog(p, c) {
-    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var dlg = freshDialog();
     var h = el("h2", null, "PR #" + c.number + " conflicts and was not picked"); h.id = "decline-title"; dlg.appendChild(h);
     dlg.appendChild(el("p", null, p.title));
     dlg.appendChild(el("p", "msg", "Nothing was changed: " + B.integrations + " is exactly as it was before. These files could not be merged automatically:"));
@@ -501,19 +517,30 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   }
   // a confirmation dialog: opts = {title, lines, reason, label, danger, run(reasonText, goButton, showError)}
   function confirmDialog(opts) {
-    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var dlg = freshDialog();
     var h = el("h2", null, opts.title); h.id = "decline-title"; dlg.appendChild(h);
     opts.lines.forEach(function (t) { dlg.appendChild(el("p", null, t)); });
-    var ta = null;
+    var ta = null, inp = null;
+    if (opts.input) {
+      inp = el("input"); inp.type = "text"; inp.maxLength = 200; inp.placeholder = opts.input; inp.setAttribute("aria-label", opts.input);
+      dlg.appendChild(inp);
+    }
     if (opts.reason) { ta = el("textarea"); ta.maxLength = 500; ta.placeholder = "Reason (optional)"; ta.setAttribute("aria-label", "Reason"); dlg.appendChild(ta); }
     var err = el("p", "msg"); err.setAttribute("role", "alert"); dlg.appendChild(err);
     var row = el("div", "row");
     row.appendChild(btn("Cancel", "", function () { dlg.close(); }));
-    var go = btn(opts.label, opts.danger ? "danger solid" : "ship-go", function () {
-      opts.run(ta ? ta.value : "", go, function (m) { err.textContent = m; });
+    var go = btn(opts.label, opts.danger ? "danger solid" : (opts.goClass || "ship-go"), function () {
+      opts.run(inp ? inp.value : (ta ? ta.value : ""), go, function (m) { err.textContent = m; });
     });
+    if (opts.blocked) { go.disabled = true; go.title = opts.blocked; }
+    else if (inp) {
+      go.disabled = true;
+      inp.addEventListener("input", function () { go.disabled = !inp.value.trim(); });
+      inp.addEventListener("keydown", function (e) { if (e.key === "Enter" && !go.disabled) { e.preventDefault(); go.click(); } });
+    }
     row.appendChild(go); dlg.appendChild(row);
     dlg.showModal();
+    if (inp) inp.focus();
   }
   function dropPicked(r) {
     var later = rows.filter(function (x) { return x.status === "local" && x.position > r.position; });
@@ -534,6 +561,45 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       label: "Ship " + local.length + " PR" + (local.length === 1 ? "" : "s"), danger: false,
       lines: [list, "This pushes the local " + B.integrations + " branch to origin (a normal push, never forced), so everyone sees these PRs as integrated. Make sure they were built and tested."],
       run: function (reason, go, showError) { post("/api/ship", {}, go, "Shipping...", null, showError); }
+    });
+  }
+  // the deploy is done: say what happened; closing the window reloads the page so the lists are current
+  function deployed(j, pushed, message) {
+    var dlg = freshDialog();
+    var h = el("h2", null, "Deployed to " + B.main); h.id = "decline-title"; dlg.appendChild(h);
+    dlg.appendChild(el("p", "done-line", "\u2713 " + pushed.length + " PR" + (pushed.length === 1 ? "" : "s") + " promoted to " + B.main + ":\n" +
+      pushed.map(function (r) { return "#" + r.number + "  " + (r.title || ""); }).join("\n")));
+    dlg.appendChild(el("p", null, "Commit message: " + message));
+    var out = j.output || "";
+    var attention = out.split("\n").filter(function (l) { return /NOT merged|Could not|could not/.test(l); });
+    if (attention.length) dlg.appendChild(el("p", "msg", "The promotion is done, but this needs your attention:\n" + attention.join("\n")));
+    var m = out.match(/https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/);
+    if (m) {
+      var p = el("p"); p.appendChild(document.createTextNode("Promotion pull request: "));
+      var a = el("a", null, m[0]); a.href = m[0]; a.target = "_blank"; a.rel = "noopener noreferrer"; p.appendChild(a);
+      dlg.appendChild(p);
+    }
+    if (out) { var d = el("details"); d.appendChild(el("summary", null, "Details")); var pre = el("pre", null, out); d.appendChild(pre); dlg.appendChild(d); }
+    var row = el("div", "row");
+    row.appendChild(btn("Done", "deploy-go", function () { dlg.close(); }));
+    dlg.appendChild(row);
+    dlg.onclose = function () { dlg.onclose = null; location.reload(); };
+    dlg.showModal();
+  }
+  function deploy(pushed, waiting) {
+    var closed = pushed.filter(function (r) { return r.closed; });
+    var blocked = waiting.length ? "Ship your picks first" : (closed.length ? "Drop the declined PRs first" : "");
+    var lines = ["These PRs are in origin/" + B.integrations + " and will be promoted to " + B.main + ":\n" +
+      pushed.map(function (r) { return "#" + r.number + "  " + (r.title || "") + (r.author ? "  (" + r.author + ")" : ""); }).join("\n")];
+    if (waiting.length) lines.push("Not shipped yet: " + waiting.map(function (r) { return "#" + r.number; }).join(", ") + ". Ship or drop them first: Deploy promotes exactly what is on origin.");
+    if (closed.length) lines.push("Declined (closed): " + closed.map(function (r) { return "#" + r.number; }).join(", ") + ". Drop them before deploying.");
+    lines.push("This is git push-master: it opens a pull request " + B.integrations + " -> " + B.main + ", merges it with a merge commit using your message, then merges " + B.main + " back into " + B.development + " and closes the picked PRs. The message becomes the commit message and PR title.");
+    confirmDialog({
+      title: "Deploy " + pushed.length + " PR" + (pushed.length === 1 ? "" : "s") + " to " + B.main + "?", lines: lines,
+      input: "Commit message (required)", label: "Deploy to " + B.main, goClass: "deploy-go", blocked: blocked,
+      run: function (message, go, showError) {
+        post("/api/deploy", {message: message}, go, "Deploying...", function (j) { deployed(j, pushed, message); }, showError);
+      }
     });
   }
   function positionOf(number) { var r = rows.filter(function (x) { return x.number === number && x.position !== null; })[0]; return r ? r.position : null; }
@@ -579,15 +645,55 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     var b = el("button", "chip", c[1] + " " + (c[0] === "all" ? prs.length : count(c[0]))); b.type = "button";
     b.setAttribute("aria-pressed", c[0] === "all" ? "true" : "false");
     b.addEventListener("click", function () {
-      filter = c[0];
+      filter = c[0]; prPager.page = 1;
       Array.prototype.forEach.call(tools.querySelectorAll(".chip"), function (x) { x.setAttribute("aria-pressed", "false"); });
       b.setAttribute("aria-pressed", "true"); drawPRs();
     });
     tools.appendChild(b);
   });
   var search = el("input"); search.type = "search"; search.placeholder = "Search"; search.setAttribute("aria-label", "Search pull requests");
-  search.addEventListener("input", function () { query = search.value.trim().toLowerCase(); drawPRs(); });
+  search.addEventListener("input", function () { query = search.value.trim().toLowerCase(); prPager.page = 1; drawPRs(); });
   tools.appendChild(search);
+
+  // pagination: 10 / 15 / 20 / All per page, 10 by default (the choice is remembered while the tab is open)
+  var SIZES = [10, 15, 20, 0];
+  function Pager(boxId, selectId, key, redraw) {
+    var self = {size: 10, page: 1};
+    try {
+      var saved = JSON.parse(sessionStorage.getItem(key) || "null");
+      if (saved && SIZES.indexOf(saved.size) >= 0) { self.size = saved.size; self.page = Math.max(1, parseInt(saved.page, 10) || 1); }
+    } catch (e) {}
+    // the items of the current page; also draws the controls
+    self.apply = function (list) {
+      var total = list.length, size = self.size;
+      var pages = size === 0 ? 1 : Math.max(1, Math.ceil(total / size));
+      self.page = Math.min(Math.max(1, self.page), pages);
+      try { sessionStorage.setItem(key, JSON.stringify({size: size, page: self.page})); } catch (e) {}
+      var items = size === 0 ? list : list.slice((self.page - 1) * size, self.page * size);
+      var box = document.getElementById(boxId); box.textContent = "";
+      if (!total) { box.hidden = true; return items; }
+      box.hidden = false;
+      var from = size === 0 ? 1 : (self.page - 1) * size + 1, to = size === 0 ? total : from + items.length - 1;
+      var info = el("span", null, "Showing " + from + "-" + to + " of " + total); info.setAttribute("aria-live", "polite");
+      box.appendChild(info);
+      var right = el("div", "grp");
+      var lab = el("label", null, "Per page "); lab.htmlFor = selectId;
+      var sel = el("select"); sel.id = selectId;
+      SIZES.forEach(function (n) { var o = el("option", null, n === 0 ? "All" : String(n)); o.value = String(n); if (n === size) o.selected = true; sel.appendChild(o); });
+      sel.addEventListener("change", function () { self.size = parseInt(sel.value, 10); self.page = 1; redraw(); });
+      lab.appendChild(sel); right.appendChild(lab);
+      if (size !== 0 && pages > 1) {
+        var prev = btn("Prev", "", function () { self.page -= 1; redraw(); }); prev.disabled = self.page <= 1; prev.setAttribute("aria-label", "Previous page");
+        var next = btn("Next", "", function () { self.page += 1; redraw(); }); next.disabled = self.page >= pages; next.setAttribute("aria-label", "Next page");
+        right.appendChild(prev); right.appendChild(el("span", null, "Page " + self.page + " of " + pages)); right.appendChild(next);
+      }
+      box.appendChild(right);
+      return items;
+    };
+    return self;
+  }
+  var prPager = Pager("pager", "page-size", "pullreqs-paging", function () { drawPRs(); });
+  var dropPager = Pager("pager-drops", "page-size-drops", "pullreqs-paging-drops", function () { drawDrops(); });
 
   function drawPRs() {
     var tb = document.querySelector("#prs tbody"); tb.textContent = "";
@@ -596,6 +702,8 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       if (!query) return true;
       return ("#" + p.number + " " + p.title + " " + p.author + " " + p.commit + " " + p.message + " " + p.head).toLowerCase().indexOf(query) >= 0;
     });
+    var total = shown.length;
+    shown = prPager.apply(shown);
     shown.forEach(function (p) {
       var tr = el("tr");
       tr.appendChild(el("td", "num", "#" + p.number));
@@ -635,8 +743,9 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       tr.appendChild(ac);
       tb.appendChild(tr);
     });
-    document.getElementById("prs-empty").hidden = shown.length > 0;
-    document.getElementById("prs").hidden = shown.length === 0;
+    document.getElementById("prs-empty").hidden = total > 0;
+    document.getElementById("prs").hidden = total === 0;
+    if (!total) document.getElementById("pager").hidden = true;
   }
   drawPRs();
 
@@ -652,7 +761,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   function drawDrops() {
     var n = Math.max(0, Math.min(pending.length, parseInt(input.value, 10) || 0));
     var tb = document.querySelector("#drops tbody"); tb.textContent = "";
-    rows.forEach(function (r) {
+    dropPager.apply(rows).forEach(function (r) {
       var tr = el("tr");
       if (r.position === null) tr.className = "released";
       else if (n && r.position <= n) tr.className = "dropping";
@@ -705,6 +814,16 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     var sb = btn("Ship " + waiting.length + " PR" + (waiting.length === 1 ? "" : "s"), "ship-go", function () { ship(waiting); });
     sb.title = "git push origin " + B.integrations;
     shipBox.appendChild(sb);
+  }
+  var deployBox = document.getElementById("deploy");
+  var pushedRows = rows.filter(function (r) { return r.status === "pushed"; });
+  if (LIVE && pushedRows.length) {
+    deployBox.hidden = false;
+    deployBox.appendChild(el("span", "grow", pushedRows.length + " PR" + (pushedRows.length === 1 ? " is" : "s are") + " in origin/" + B.integrations + " and not in " + B.main + " yet: " +
+      pushedRows.map(function (r) { return "#" + r.number; }).join(", ") + (waiting.length ? ". Ship your picks first." : ". Tested? Deploy them.")));
+    var db = btn("Deploy to " + B.main, "deploy-go", function () { deploy(pushedRows, waiting); });
+    db.title = "git push-master -m \"message\"";
+    deployBox.appendChild(db);
   }
   var de = document.getElementById("drops-empty");
   if (!D.integration.exists) { de.hidden = false; de.textContent = "The integrations branch does not exist yet. Pick PRs first:  git pullreqs -p <PR numbers>"; document.getElementById("drops").hidden = true; }
