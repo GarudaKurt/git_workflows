@@ -116,12 +116,41 @@ class Session:
                 return 409, {"ok": False, "message": "PR #{} is not ready to pick (status: {}).".format(number, pr["status"])}
             return self._basket(basket.pick, number)
 
+    def pick_many(self, numbers, ship_after: bool) -> Tuple[int, dict]:
+        with self.lock:
+            prs = {p["number"]: p for p in self.data(max_age=3600)["prs"]}
+            numbers = sorted(set(numbers))                                  # oldest PR number first
+            for n in numbers:
+                if n not in prs:
+                    return 404, {"ok": False, "message": "PR #{} is not in the list. Reload the page.".format(n)}
+                if prs[n]["status"] != "ready":
+                    return 409, {"ok": False, "message": "PR #{} is not ready to pick (status: {}).".format(n, prs[n]["status"])}
+            busy = self._busy()
+            if busy:
+                return busy
+            out = basket.pick_many(numbers, ship_after)
+            self.data(max_age=0)
+            everything = len(out["picked"]) == len(numbers) and (not ship_after or out["shipped"])
+            out.update(ok=bool(everything), message="Picked {} of {} PR(s).".format(len(out["picked"]), len(numbers)))
+            return 200, out
+
     def unpick(self, number: int, reason: str) -> Tuple[int, dict]:
         with self.lock:
             rows = self.data(max_age=3600)["integration"]["rows"]
             if not any(r["number"] == number and r["status"] == "local" for r in rows):
                 return 409, {"ok": False, "message": "PR #{} is not a picked, unpushed PR. Reload the page.".format(number)}
             return self._basket(basket.unpick, number, reason)
+
+    def unpick_many(self, numbers, reason: str) -> Tuple[int, dict]:
+        with self.lock:
+            rows = self.data(max_age=3600)["integration"]["rows"]
+            local = {r["number"] for r in rows if r["status"] == "local"}
+            numbers = sorted(set(numbers))
+            bad = [n for n in numbers if n not in local]
+            if bad:
+                return 409, {"ok": False, "message": "{} is not a picked, unpushed PR. Reload the page.".format(
+                    ", ".join("PR #%d" % n for n in bad))}
+            return self._basket(basket.unpick_many, numbers, reason)
 
     def ship(self) -> Tuple[int, dict]:
         with self.lock:
@@ -167,6 +196,14 @@ class Session:
                 return 200, {"ok": True, "output": text,
                              "message": "Deployed {} to {}: {}".format(numbers, self.data()["branches"]["main"], message)}
             return 500, {"ok": False, "output": text, "message": text.strip()[-600:] or "git push-master failed"}
+
+    def conflict(self, number: int, files) -> Tuple[int, dict]:
+        """Read-only: the conflicting hunks of picking PR number (base / integrations / PR), like a merge tool shows."""
+        with self.lock:
+            if not any(p["number"] == number for p in self.data(max_age=3600)["prs"]):
+                return 404, {"ok": False, "message": "PR #{} is not in the list. Reload the page.".format(number)}
+            view = basket.conflict_view(number, files)
+            return 200, {"ok": True, "view": view, "message": "ok"}
 
     def decline(self, number: int, reason: str) -> Tuple[int, dict]:
         """(http status, json) for 'decline (close) PR number' on GitHub, with an optional reason as a comment."""
@@ -267,7 +304,7 @@ def _checkout_with_git(number: int, head: str) -> Tuple[bool, str]:
     return (True, "") if r.returncode == 0 else (False, "git switch {} failed: {}".format(branch, (r.stderr or r.stdout).strip()[-300:]))
 
 
-ROUTES = ("/api/checkout", "/api/decline", "/api/reopen", "/api/pick", "/api/unpick", "/api/ship", "/api/deploy")
+ROUTES = ("/api/checkout", "/api/decline", "/api/reopen", "/api/pick", "/api/unpick", "/api/ship", "/api/deploy", "/api/conflict", "/api/pick-many", "/api/unpick-many")
 
 
 def make_handler(session: Session):
@@ -317,20 +354,33 @@ def make_handler(session: Session):
                 return self._json(403, {"ok": False, "message": "missing or wrong token: reload the page"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 4096:
+                if not 0 < length <= 65536:
                     raise ValueError
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 if not isinstance(body, dict):
                     raise ValueError
                 number = body.get("number")
+                numbers = []
                 if self.path in ("/api/ship", "/api/deploy"):
                     number = 0                                      # these have no PR number
+                elif self.path in ("/api/pick-many", "/api/unpick-many"):
+                    number = 0
+                    numbers = body.get("numbers")
+                    if (not isinstance(numbers, list) or not 0 < len(numbers) <= 50
+                            or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in numbers)):
+                        raise ValueError
+                    if not isinstance(body.get("ship", False), bool):
+                        raise ValueError
                 elif not isinstance(number, int) or isinstance(number, bool) or number <= 0:
                     raise ValueError
                 reason = body.get("reason", "")
                 if not isinstance(reason, str) or len(reason) > 500:
                     return self._json(400, {"ok": False, "message": "reason must be text of at most 500 characters"})
                 reason = "".join(c for c in reason if c in "\n" or c.isprintable()).strip()
+                files = body.get("files")
+                if files is not None and (not isinstance(files, list) or len(files) > 100
+                                          or not all(isinstance(f, str) and len(f) < 1024 for f in files)):
+                    return self._json(400, {"ok": False, "message": "files must be a list of paths"})
                 message = body.get("message", "")
                 if not isinstance(message, str) or len(message) > 200:
                     return self._json(400, {"ok": False, "message": "message must be text of at most 200 characters"})
@@ -350,6 +400,12 @@ def make_handler(session: Session):
                     status, payload = session.ship()
                 elif self.path == "/api/deploy":
                     status, payload = session.deploy(message)
+                elif self.path == "/api/conflict":
+                    status, payload = session.conflict(number, files)
+                elif self.path == "/api/pick-many":
+                    status, payload = session.pick_many(numbers, body.get("ship", False))
+                elif self.path == "/api/unpick-many":
+                    status, payload = session.unpick_many(numbers, reason)
                 else:
                     status, payload = session.checkout(number)
             except subprocess.TimeoutExpired:

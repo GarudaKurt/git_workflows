@@ -268,9 +268,26 @@ td.acts{white-space:nowrap}
 .btn[disabled]{opacity:.6;cursor:progress}
 .ship{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 12px;padding:10px 12px;border:1px solid var(--picked);background:var(--picked-bg);color:var(--picked);border-radius:8px;font-size:14px}
 .ship[hidden]{display:none}
+.ship.dropbar{border-color:var(--bad);background:var(--bad-bg);color:var(--bad)}
+.ship.pickbar{border-color:var(--ready);background:var(--ready-bg);color:var(--ready)}
+td.sel,th#sel-th,th#dsel-th{width:28px;padding-right:0} td.sel input,th#sel-th input,th#dsel-th input{width:16px;height:16px;cursor:pointer}
+.res{margin:4px 0;padding:6px 8px;border-radius:6px;border:1px solid var(--line);font-size:13px;display:flex;gap:8px;align-items:center;justify-content:space-between}
+.res.good{border-color:var(--ok,#1a7f37)} .res.bad{border-color:var(--bad)} .res .t{flex:1;min-width:0}
 .ship.deploy{border-color:var(--ok,#1a7f37);background:var(--ok-bg,#e6f4ea);color:var(--ok,#1a7f37)}
 .btn.deploy-go{background:#1a7f37;color:#fff;border-color:#1a7f37;font-weight:600}
 dialog .msg,dialog p{white-space:pre-wrap}
+dialog.wide{max-width:1180px}
+.cv-files{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.cv-hunk{margin:10px 0 14px} .cv-hunk h3{margin:0 0 6px;font-size:13px;color:var(--muted,#667085)}
+.cv-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+@media(max-width:820px){.cv-grid{grid-template-columns:minmax(0,1fr)}}
+dialog.wide .msg{max-width:none}
+.cv-col{display:flex;flex-direction:column;min-width:0} .cv-col pre{flex:1}
+.cv-col h4{margin:0 0 4px;font-size:12px;font-weight:600}
+.cv-col pre{margin:0;padding:6px 0;max-height:260px;overflow:auto;font-size:12px;line-height:1.5;background:var(--bg);border:1px solid var(--line);border-radius:6px;white-space:pre}
+.cv-col .ln{display:block;padding:0 8px;min-height:1.5em}
+.cv-col .ctx{opacity:.55}
+.cv-col.ours .chg{background:var(--ready-bg);color:var(--ink)} .cv-col.theirs .chg{background:var(--picked-bg);color:var(--ink)}
 dialog .done-line{color:var(--ok,#1a7f37);font-weight:600}
 dialog details{margin:8px 0;font-size:13px} dialog pre{max-height:220px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;white-space:pre-wrap;word-break:break-word;font-size:12px}
 .pager{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;font-size:13px;color:var(--muted,#667085)}
@@ -319,8 +336,9 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     <h2 id="h-prs">Pull requests</h2>
     <p class="hint">Author, and the latest commit of each pull request (id and message). Open PRs can be checked out: copy the link or the command, or press Checkout when the report was started with <code>git pullreqs --report --serve</code>.</p>
     <div class="tools" id="tools"></div>
+    <div class="ship pickbar" id="pickbar" hidden></div>
     <div class="scroll"><table id="prs">
-      <thead><tr><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th><th>Checkout</th></tr></thead>
+      <thead><tr><th id="sel-th" hidden><input type="checkbox" id="sel-all" aria-label="Select all ready PRs on this page"></th><th>PR</th><th>Title</th><th>Author</th><th>Branch</th><th>Latest commit</th><th>Status</th><th>Checkout</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="pager" id="pager" hidden></div>
@@ -332,9 +350,10 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     <p class="hint">Numbered in the order the PRs were picked. <code>git drop -N</code> removes the first N <em>positions</em>, not PR numbers.</p>
     <div class="ship" id="ship" hidden></div>
     <div class="ship deploy" id="deploy" hidden></div>
+    <div class="ship dropbar" id="dropbar" hidden></div>
     <div class="sim" id="sim"></div>
     <div class="scroll"><table id="drops">
-      <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th id="dsel-th" hidden><input type="checkbox" id="dsel-all" aria-label="Select all unpushed picks on this page"></th><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th><th></th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="pager" id="pager-drops" hidden></div>
@@ -450,7 +469,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
         .catch(function () { err.textContent = "Could not reach the report server."; go.disabled = false; go.textContent = "Decline PR #" + p.number; });
     });
     row.appendChild(cancel); row.appendChild(go); dlg.appendChild(row);
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
   }
   function reopen(p, button) {
     button.disabled = true; button.textContent = "Reopening...";
@@ -463,7 +482,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       .catch(function () { say("warn", "Could not reach the report server."); button.disabled = false; button.textContent = "Reopen"; });
   }
   function freshDialog() {
-    var dlg = document.getElementById("decline-dlg"); dlg.textContent = ""; dlg.onclose = null; return dlg;
+    var dlg = document.getElementById("decline-dlg"); dlg.textContent = ""; dlg.onclose = null; dlg.className = ""; return dlg;
   }
   // a POST that ends with a flash message after the reload (Pick, Drop, Ship)
   function post(url, payload, button, busy, again, fail) {
@@ -507,13 +526,16 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     var row = el("div", "row");
     var dlg2 = dlg;
     row.appendChild(btn("Close", "", function () { dlg2.close(); }));
+    var vw = btn("View conflict", "primary", function () { viewConflict(p, c, vw); });
+    vw.title = "Show the conflicting code: base, " + B.integrations + " and the PR side by side (read-only)";
+    row.appendChild(vw);
     var cp = btn("Copy command", "", function () { copy(c.command, cp, "Copied"); }); cp.title = c.command; row.appendChild(cp);
     row.appendChild(btn("Decline PR #" + c.number, "danger", function () {
       dlg2.close();
       decline(p, null, "Conflicts with " + (who.length ? who.join(", ") + " in " : "the picked PRs in ") + c.files.map(function (f) { return f.path; }).join(", ") + ". Please rebase on the latest development and update the PR.");
     }));
     dlg.appendChild(row);
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
   }
   // a confirmation dialog: opts = {title, lines, reason, label, danger, run(reasonText, goButton, showError)}
   function confirmDialog(opts) {
@@ -539,8 +561,75 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       inp.addEventListener("keydown", function (e) { if (e.key === "Enter" && !go.disabled) { e.preventDefault(); go.click(); } });
     }
     row.appendChild(go); dlg.appendChild(row);
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
     if (inp) inp.focus();
+  }
+  // read-only three-pane view of the conflicting code (what git mergetool / kdiff3 shows), fetched on demand
+  function viewConflict(p, c, button) {
+    var label = button.textContent; button.disabled = true; button.textContent = "Loading...";
+    fetch("/api/conflict", {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token},
+      body: JSON.stringify({number: c.number, files: c.files.map(function (f) { return f.path; })})})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (res.ok) conflictViewer(p, c, res.j.view);
+        else { say("warn", res.j.message || "Could not load the conflict"); button.disabled = false; button.textContent = label; }
+      })
+      .catch(function () { say("warn", "Could not reach the report server."); button.disabled = false; button.textContent = label; });
+  }
+  function conflictViewer(p, c, view) {
+    var dlg = freshDialog(); dlg.className = "wide";
+    var h = el("h2", null, "Conflict in PR #" + c.number); h.id = "decline-title"; dlg.appendChild(h);
+    dlg.appendChild(el("p", "msg", "Read-only, like git mergetool. Left to right: the common ancestor (base " + view.base + "), " + view.ours +
+      " (what is already picked), and " + view.theirs + ". Shaded lines are the ones that changed on that side. Resolve it with  " + c.command + "  in a terminal, or decline the PR."));
+    var chips = el("div", "cv-files"), body = el("div");
+    dlg.appendChild(chips); dlg.appendChild(body);
+    function lines(list, cls) { return list.map(function (t) { var s = el("span", "ln" + (cls ? " " + cls : ""), t === "" ? " " : t); return s; }); }
+    function column(kind, title, before, mid, after, baseLines) {
+      var col = el("div", "cv-col " + kind); col.appendChild(el("h4", null, title));
+      var pre = el("pre");
+      lines(before, "ctx").forEach(function (n) { pre.appendChild(n); });
+      var inBase = {}; baseLines.forEach(function (t) { inBase[t] = (inBase[t] || 0) + 1; });
+      mid.forEach(function (t) {
+        var changed = kind !== "base" && !(inBase[t] > 0);
+        if (changed) { /* a line that the base does not have */ } else if (kind !== "base") inBase[t] -= 1;
+        pre.appendChild(el("span", "ln" + (changed ? " chg" : ""), t === "" ? " " : t));
+      });
+      lines(after, "ctx").forEach(function (n) { pre.appendChild(n); });
+      col.appendChild(pre); return col;
+    }
+    function show(f) {
+      body.textContent = "";
+      Array.prototype.forEach.call(chips.children, function (x) { x.setAttribute("aria-pressed", x.dataset.path === f.path ? "true" : "false"); });
+      var note = {binary: "Binary file: it cannot be shown as text.", too_large: "The file is too large to show here.",
+                  clean: "Plain git merges this file without a conflict (the automatic resolver handles it); the conflict is in another file.",
+                  error: "git could not compare this file."}[f.status];
+      if (note) { body.appendChild(el("p", "msg", f.path + ": " + note)); return; }
+      if (f.status === "deleted_ours") body.appendChild(el("p", "msg", f.path + " was deleted in " + view.ours + " but changed in " + view.theirs + ". The PR's version is on the right."));
+      if (f.status === "deleted_theirs") body.appendChild(el("p", "msg", f.path + " was changed in " + view.ours + " but deleted in " + view.theirs + ". The picked version is in the middle."));
+      f.hunks.forEach(function (hk, i) {
+        var box = el("div", "cv-hunk");
+        box.appendChild(el("h3", null, f.path + (f.conflicts > 1 ? "  -  conflict " + (i + 1) + " of " + f.conflicts : "")));
+        var grid = el("div", "cv-grid");
+        grid.appendChild(column("base", "Base", hk.before, hk.base, hk.after, hk.base));
+        grid.appendChild(column("ours", view.ours + " (picked)", hk.before, hk.ours, hk.after, hk.base));
+        grid.appendChild(column("theirs", view.theirs, hk.before, hk.theirs, hk.after, hk.base));
+        box.appendChild(grid); body.appendChild(box);
+      });
+      if (f.conflicts > f.hunks.length) body.appendChild(el("p", "msg", (f.conflicts - f.hunks.length) + " more conflict(s) in this file are not shown."));
+      if (!f.hunks.length && f.status === "conflict") body.appendChild(el("p", "msg", "No conflicting hunk to show."));
+    }
+    if (!view.files.length) body.appendChild(el("p", "msg", "git no longer reports a conflict for this PR (the picked PRs may have changed). Try Pick again."));
+    view.files.forEach(function (f, i) {
+      var b = el("button", "chip", f.path + (f.conflicts ? " (" + f.conflicts + ")" : "")); b.type = "button"; b.dataset.path = f.path;
+      b.addEventListener("click", function () { show(f); });
+      chips.appendChild(b);
+      if (i === 0) show(f);
+    });
+    var row = el("div", "row");
+    row.appendChild(btn("Back", "", function () { conflictDialog(p, c); }));
+    row.appendChild(btn("Close", "", function () { dlg.close(); }));
+    dlg.appendChild(row);
+    if (!dlg.open) dlg.showModal();
   }
   function dropPicked(r) {
     var later = rows.filter(function (x) { return x.status === "local" && x.position > r.position; });
@@ -584,7 +673,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     row.appendChild(btn("Done", "deploy-go", function () { dlg.close(); }));
     dlg.appendChild(row);
     dlg.onclose = function () { dlg.onclose = null; location.reload(); };
-    dlg.showModal();
+    if (!dlg.open) dlg.showModal();
   }
   function deploy(pushed, waiting) {
     var closed = pushed.filter(function (r) { return r.closed; });
@@ -695,6 +784,75 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   var prPager = Pager("pager", "page-size", "pullreqs-paging", function () { drawPRs(); });
   var dropPager = Pager("pager-drops", "page-size-drops", "pullreqs-paging-drops", function () { drawDrops(); });
 
+  // multi-select: tick Ready PRs, then pick them all at once (oldest PR number first)
+  var selected = {}, shipAfter = false, needsReload = false;
+  var selTh = document.getElementById("sel-th"), selAll = document.getElementById("sel-all"), pickbar = document.getElementById("pickbar");
+  selTh.hidden = !LIVE;
+  document.getElementById("decline-dlg").addEventListener("close", function () { if (needsReload) location.reload(); });
+  selAll.addEventListener("change", function () {
+    pageReady().forEach(function (p) { if (selAll.checked) selected[p.number] = true; else delete selected[p.number]; });
+    drawPRs();
+  });
+  var lastShown = [];
+  function pageReady() { return lastShown.filter(function (p) { return p.status === "ready"; }); }
+  function selectedNumbers() { return Object.keys(selected).map(Number).sort(function (a, b) { return a - b; }); }
+  function syncSelection(shown) {
+    if (!LIVE) return;
+    lastShown = shown;
+    var ready = pageReady(), n = ready.filter(function (p) { return selected[p.number]; }).length;
+    selAll.disabled = !ready.length; selAll.checked = !!ready.length && n === ready.length; selAll.indeterminate = n > 0 && n < ready.length;
+    var nums = selectedNumbers();
+    pickbar.hidden = !nums.length; pickbar.textContent = "";
+    if (!nums.length) return;
+    pickbar.appendChild(el("span", "grow", nums.length + " selected: " + nums.map(function (x) { return "#" + x; }).join(", ") + ". They are picked in this order (oldest first)."));
+    var lab = el("label"); var ck = el("input"); ck.type = "checkbox"; ck.checked = shipAfter; ck.id = "ship-after";
+    ck.addEventListener("change", function () { shipAfter = ck.checked; });
+    lab.appendChild(ck); lab.appendChild(document.createTextNode(" Ship right after picking")); pickbar.appendChild(lab);
+    var go = btn("Pick " + nums.length + " PR" + (nums.length === 1 ? "" : "s"), "primary solid", function () { pickSelected(nums, go); });
+    pickbar.appendChild(go);
+    pickbar.appendChild(btn("Clear", "", function () { selected = {}; drawPRs(); }));
+  }
+  function pickSelected(nums, button) {
+    if (!shipAfter) return runPickMany(nums, false, button, function (m) { say("warn", m); });
+    var others = rows.filter(function (r) { return r.status === "local"; }).map(function (r) { return "#" + r.number; });
+    confirmDialog({
+      title: "Pick " + nums.length + " PR" + (nums.length === 1 ? "" : "s") + " and ship them?", reason: false,
+      label: "Pick and ship", danger: false,
+      lines: [nums.map(function (x) { return "#" + x; }).join(", "),
+        "They are picked into your local " + B.integrations + " branch, then " + B.integrations + " is pushed to origin (a normal push, never forced). The push sends everything picked and not pushed yet" +
+        (others.length ? ", including " + others.join(", ") + " that you picked earlier" : "") + ". If one of the selected PRs conflicts, nothing is pushed.",
+        "Make sure they were built and tested."],
+      run: function (x, go, showError) { runPickMany(nums, true, go, showError); }
+    });
+  }
+  function runPickMany(nums, ship, button, fail) {
+    var label = button.textContent; button.disabled = true; button.textContent = "Picking...";
+    fetch("/api/pick-many", {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify({numbers: nums, ship: ship})})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (res.ok) pickResults(res.j, nums);
+        else { fail(res.j.message || "failed"); button.disabled = false; button.textContent = label; }
+      })
+      .catch(function () { fail("Could not reach the report server."); button.disabled = false; button.textContent = label; });
+  }
+  function pickResults(j, nums) {
+    var dlg = freshDialog(); needsReload = true;
+    var h = el("h2", null, j.ok ? "Picked " + j.picked.length + " PR" + (j.picked.length === 1 ? "" : "s") : "Picked " + j.picked.length + " of " + nums.length); h.id = "decline-title"; dlg.appendChild(h);
+    j.results.forEach(function (r) {
+      var p = prs.filter(function (x) { return x.number === r.number; })[0] || {number: r.number, title: ""};
+      var good = r.status === "picked" || r.status === "resolved" || r.status === "skipped";
+      var row = el("div", "res " + (good ? "good" : "bad"));
+      row.appendChild(el("span", "t", (good ? "\u2713 " : "\u2717 ") + "#" + r.number + "  " + (p.title || "") + "\n    " + r.message));
+      if (r.conflict) { var vb = btn("View conflict", "primary", function () { viewConflict(p, r.conflict, vb); }); row.appendChild(vb); }
+      dlg.appendChild(row);
+    });
+    if (j.shipped === true) dlg.appendChild(el("p", "done-line", "\u2713 " + j.ship_message));
+    else if (j.shipped === false) dlg.appendChild(el("p", "msg", j.ship_message));
+    else if (j.picked.length) dlg.appendChild(el("p", null, "The picks are local only. Test them, then use Ship."));
+    var row2 = el("div", "row"); row2.appendChild(btn("Done", "primary solid", function () { dlg.close(); })); dlg.appendChild(row2);
+    if (!dlg.open) dlg.showModal();
+  }
+
   function drawPRs() {
     var tb = document.querySelector("#prs tbody"); tb.textContent = "";
     var shown = prs.filter(function (p) {
@@ -706,6 +864,16 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     shown = prPager.apply(shown);
     shown.forEach(function (p) {
       var tr = el("tr");
+      if (LIVE) {
+        var sc = el("td", "sel");
+        if (p.status === "ready") {
+          var cb = el("input"); cb.type = "checkbox"; cb.checked = !!selected[p.number];
+          cb.setAttribute("aria-label", "Select PR #" + p.number);
+          cb.addEventListener("change", function () { if (cb.checked) selected[p.number] = true; else delete selected[p.number]; syncSelection(shown); });
+          sc.appendChild(cb);
+        }
+        tr.appendChild(sc);
+      }
       tr.appendChild(el("td", "num", "#" + p.number));
       tr.appendChild(el("td", "title", p.title));
       tr.appendChild(el("td", null, p.author));
@@ -743,6 +911,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       tr.appendChild(ac);
       tb.appendChild(tr);
     });
+    syncSelection(shown);
     document.getElementById("prs-empty").hidden = total > 0;
     document.getElementById("prs").hidden = total === 0;
     if (!total) document.getElementById("pager").hidden = true;
@@ -758,11 +927,58 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   sim.appendChild(lab); sim.appendChild(input); sim.appendChild(out);
   if (!pending.length) sim.hidden = true;
 
+  // multi-select drop: tick unpushed picks, then remove them all in one rebuild
+  var dropSel = {}, lastDropShown = [];
+  var dselTh = document.getElementById("dsel-th"), dselAll = document.getElementById("dsel-all"), dropbar = document.getElementById("dropbar");
+  dselTh.hidden = !LIVE;
+  dselAll.addEventListener("change", function () {
+    lastDropShown.filter(function (r) { return r.status === "local"; }).forEach(function (r) { if (dselAll.checked) dropSel[r.number] = true; else delete dropSel[r.number]; });
+    drawDrops();
+  });
+  function syncDropSelection(shown) {
+    if (!LIVE) return;
+    lastDropShown = shown;
+    var local = shown.filter(function (r) { return r.status === "local"; }), n = local.filter(function (r) { return dropSel[r.number]; }).length;
+    dselAll.disabled = !local.length; dselAll.checked = !!local.length && n === local.length; dselAll.indeterminate = n > 0 && n < local.length;
+    var nums = Object.keys(dropSel).map(Number).sort(function (a, b) { return a - b; });
+    dropbar.hidden = !nums.length; dropbar.textContent = "";
+    if (!nums.length) return;
+    dropbar.appendChild(el("span", "grow", nums.length + " selected to drop: " + nums.map(function (x) { return "#" + x; }).join(", ") + "."));
+    var go = btn("Drop " + nums.length + " PR" + (nums.length === 1 ? "" : "s"), "danger solid", function () { dropSelected(nums); });
+    dropbar.appendChild(go);
+    dropbar.appendChild(btn("Clear", "", function () { dropSel = {}; drawDrops(); }));
+  }
+  function dropSelected(nums) {
+    var picked = rows.filter(function (r) { return nums.indexOf(r.number) >= 0; });
+    var first = Math.min.apply(null, picked.map(function (r) { return r.position; }));
+    var later = rows.filter(function (r) { return r.status === "local" && nums.indexOf(r.number) < 0 && r.position > first; });
+    confirmDialog({
+      title: "Drop " + nums.length + " PR" + (nums.length === 1 ? "" : "s") + " from the picks?", reason: true,
+      label: "Drop " + nums.length + " PR" + (nums.length === 1 ? "" : "s"), danger: true,
+      lines: [picked.map(function (r) { return "#" + r.number + "  " + (r.title || ""); }).join("\n"),
+        "They were picked into " + B.integrations + " but not pushed, so only your local branch changes. " +
+        (later.length ? "The PRs picked after the first of them (" + later.map(function (r) { return "#" + r.number; }).join(", ") + ") are merged again on top; if one of them no longer merges, nothing is changed." : "Nothing else is affected."),
+        "The PRs stay open on GitHub. To reject one as well, use Decline."],
+      run: function (reason, go, showError) { post("/api/unpick-many", {numbers: nums, reason: reason}, go, "Dropping...", null, showError); }
+    });
+  }
+
   function drawDrops() {
     var n = Math.max(0, Math.min(pending.length, parseInt(input.value, 10) || 0));
     var tb = document.querySelector("#drops tbody"); tb.textContent = "";
-    dropPager.apply(rows).forEach(function (r) {
+    var dropShown = dropPager.apply(rows);
+    dropShown.forEach(function (r) {
       var tr = el("tr");
+      if (LIVE) {
+        var dc = el("td", "sel");
+        if (r.status === "local") {
+          var dcb = el("input"); dcb.type = "checkbox"; dcb.checked = !!dropSel[r.number];
+          dcb.setAttribute("aria-label", "Select PR #" + r.number + " to drop");
+          dcb.addEventListener("change", function () { if (dcb.checked) dropSel[r.number] = true; else delete dropSel[r.number]; syncDropSelection(dropShown); });
+          dc.appendChild(dcb);
+        }
+        tr.appendChild(dc);
+      }
       if (r.position === null) tr.className = "released";
       else if (n && r.position <= n) tr.className = "dropping";
       else if (n) tr.className = "kept";
@@ -795,6 +1011,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
       tr.appendChild(a);
       tb.appendChild(tr);
     });
+    syncDropSelection(dropShown);
     if (!pending.length) out.textContent = "";
     else if (!n) out.textContent = "nothing is dropped";
     else {
