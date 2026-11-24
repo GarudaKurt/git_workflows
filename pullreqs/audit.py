@@ -18,7 +18,8 @@ import subprocess
 import sys
 from typing import Iterable, List, Optional
 
-ACTIONS = ("pick", "pick_failed", "drop", "drop_failed", "promote", "promote_failed", "decline", "reopen", "checkout")
+ACTIONS = ("pick", "pick_failed", "drop", "drop_failed", "ship", "ship_failed", "promote", "promote_failed",
+           "decline", "reopen", "checkout")
 
 _warned = False
 
@@ -91,6 +92,17 @@ def record(action: str, pr: Optional[int] = None, via: str = "cli", **fields) ->
             _warned = True
             print("warning: could not write the audit log: {}".format(e), file=sys.stderr)
         return False
+
+
+def log_pick(rep, via: str = "cli") -> None:
+    """One entry per PR that was merged or that could not be (rep is an integration.Report)."""
+    for o in rep.outcomes:
+        if o.status in ("merged", "resolved"):
+            record("pick", o.number, via=via, branch=rep.branch, result=o.status, auto_resolved=o.files)
+        elif o.status in ("failed", "error"):
+            record("pick_failed", o.number, via=via, branch=rep.branch, result=o.status, files=o.files,
+                   why=["{}: {}".format(f, r) for f, r in o.reasons.items()], detail=o.detail,
+                   paused=o.held, fixed_by_hand=o.manual)
 
 
 def read(path: str) -> List[dict]:

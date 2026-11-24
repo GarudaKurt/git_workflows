@@ -171,13 +171,13 @@ git pullreqs --report -o ~/pullreqs-report.html
 explorer.exe "$(wslpath -w ~/pullreqs-report.html)"      # WSL: open in Windows
 ```
 
-**Checkout from the report.** Open PRs (for example the ones under *Ready to pick*) have a **Copy link**, a **Copy command** (`gh pr checkout N`) and, in the live version, a **Checkout** button that switches your working copy to that PR's branch:
+**Checkout from the report.** Open PRs (for example the ones under *Ready to pick*) have a **Checkout** button in the live version (the only checkout button; no copy buttons there) that switches your working copy to that PR's branch:
 
 ```bash
 git pullreqs --report --serve --open      # http://127.0.0.1:8765, Ctrl+C to stop
 ```
 
-A plain `.html` file cannot run git, so the copy buttons are all it offers; `--serve` starts a small local server (127.0.0.1 only, protected by a random token) for the repository you are in. Checkout is refused while you have uncommitted changes or a merge is in progress, so your work is never touched. Reload the page to refresh the list. Windows/WSL: the browser on Windows can open the printed `127.0.0.1` address.
+A plain `.html` file cannot run git, so the *Copy link* and *Copy command* (`gh pr checkout N`) buttons are all it offers; `--serve` starts a small local server (127.0.0.1 only, protected by a random token) for the repository you are in. Checkout is refused while you have uncommitted changes or a merge is in progress, so your work is never touched. Reload the page to refresh the list. Windows/WSL: the browser on Windows can open the printed `127.0.0.1` address.
 
 **Decline from the report.** In the live version (`--serve`) every open PR that is not promoted yet has a red **Decline** button, in the PR table (*Ready to pick*, in integration, ...) and in the integrations list. It opens a dialog with an optional reason; confirming runs `gh pr close N --comment "Declined via git pullreqs report. Reason: ..."`, so the PR becomes *Closed* on GitHub, exactly as when a reviewer declines it. Needs `gh` logged in (closing is a GitHub action, there is no git fallback). A PR that was already picked into integrations is then shown as **Closed, still in integrations**: closing does not remove its merge from the branch, so run `git drop -N` (N = its position) and re-pick the others. `git push-master` refuses to promote a declined PR (override: `--allow-declined`). A saved `.html` snapshot has no Decline buttons. A closed PR shows a **Reopen** button (`gh pr reopen N`), in case it was declined by mistake or the developer has fixed it; GitHub refuses when the branch was deleted or the PR was merged, and the message is shown on the page. A reopened PR is *Ready to pick* again.
 
@@ -206,14 +206,32 @@ One self-contained page: counts, each PR's author, branch, latest commit id and 
 - The 1010+ custom IDs from earlier versions (`--sync`) are kept for compatibility but are not used by `-p`, `git drop` or `git push-master`.
 - Details of every command: `WORKFLOW.md`, or `-h` on each command (`git drop -h`; plain `git drop --help` does not work, git looks for a man page).
 
+## Pick, Drop and Ship from the report
+
+The manual steps can all be done in the live report (`git pullreqs --report --serve`), next to the commands:
+
+| Button | Where | Same as | What it does |
+|---|---|---|---|
+| **Pick** | PR table, PRs that are *Ready to pick* | `git pullreqs -p N` | merges the PR into your local `integrations` branch (conflicts are resolved automatically when possible; otherwise nothing changes and a **conflict window** opens: the conflicting files, why, which already-picked PR also changed each one, what you can do (drop that PR first, resolve in a terminal, or decline the PR with the conflict filled in as the reason). **Nothing is pushed.** |
+| **Drop** | *Drops* table, PRs that are *Local only* | `git drop` (for unpushed picks) | removes that one PR from the picks. The branch is rebuilt off to the side and the PRs picked after it are merged again on top; if one of them no longer merges, nothing is changed. The PR stays open on GitHub (use **Decline** to reject it too). |
+| **Ship N PRs** | bar above the *Drops* table, shown while picks are waiting | `git push` | pushes `integrations` to origin after a confirmation. A normal push, never forced. Refused when a waiting PR was declined, or when the branch diverged from origin. |
+
+Notes:
+- Pick, Drop and Ship need a clean working tree and no merge in progress; the message tells you what to fix. Pick switches your workspace to the `integrations` branch.
+- Drop works only for PRs that are **not pushed**. A pushed PR rewrites the published branch, so it stays a terminal job: `git drop -N`.
+- Unlike `git drop -N`, Drop removes only the PR you chose, not the ones picked before it. It refuses if the branch holds commits that are not picked PRs (a rebuild would lose them).
+- Everything is written to the audit log (`pick`, `drop` with `unpushed: true`, `ship`, `ship_failed`, `via: report`).
+- A saved `.html` snapshot has no buttons.
+
 ## Audit log
 
 Every action that changes what goes to `main` is recorded in an append-only file, one JSON line per event, so "why was #24 removed, and by whom?" always has an answer:
 
 | action | written by | useful fields |
 |---|---|---|
-| `pick` / `pick_failed` | `git pullreqs -p` | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
-| `drop` / `drop_failed` | `git drop -N` | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
+| `pick` / `pick_failed` | `git pullreqs -p`, report **Pick** | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
+| `drop` / `drop_failed` | `git drop -N`, report **Drop** | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
+| `ship` / `ship_failed` | report **Ship** | merge, tip, PRs shipped together, why it was rejected |
 | `promote` / `promote_failed` | `git push-master` | promotion PR number, message, PRs promoted together, why it failed |
 | `decline`, `reopen`, `checkout` | the live report | reason, title, author, position in integrations |
 

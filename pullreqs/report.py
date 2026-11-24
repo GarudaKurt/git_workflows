@@ -266,13 +266,17 @@ td.acts{white-space:nowrap}
 .btn:hover{border-color:var(--accent)}
 .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .btn[disabled]{opacity:.6;cursor:progress}
+.ship{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 12px;padding:10px 12px;border:1px solid var(--picked);background:var(--picked-bg);color:var(--picked);border-radius:8px;font-size:14px}
+.ship[hidden]{display:none}
+.ship .grow{flex:1;min-width:200px}
+.btn.ship-go{background:var(--ready);color:#fff;border-color:var(--ready);font-weight:600}
 .btn.danger{color:var(--bad);border-color:var(--bad)} .btn.danger:hover{background:var(--bad-bg)}
 .btn.danger.solid{background:var(--bad);color:#fff;font-weight:600}
 dialog{border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);padding:18px 20px;max-width:520px;width:calc(100% - 32px)}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog h2{margin:0 0 8px;font-size:17px} dialog p{margin:6px 0;font-size:14px}
 dialog textarea{width:100%;box-sizing:border-box;min-height:80px;margin:8px 0;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
-dialog .row{display:flex;gap:8px;justify-content:flex-end}
+dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .here{display:inline-block;margin-left:6px;border-radius:999px;padding:1px 8px;font-size:11.5px;font-weight:600;background:var(--done-bg);color:var(--done)}
 .cmds{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:6px 24px;font-size:13px;color:var(--muted)}
 .cmds code{color:var(--ink)}
@@ -316,6 +320,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
   <section class="card" aria-labelledby="h-drop">
     <h2 id="h-drop">Drops: the trial integration <span class="sub" style="font-weight:400">(what <code>git drop</code> lists)</span></h2>
     <p class="hint">Numbered in the order the PRs were picked. <code>git drop -N</code> removes the first N <em>positions</em>, not PR numbers.</p>
+    <div class="ship" id="ship" hidden></div>
     <div class="sim" id="sim"></div>
     <div class="scroll"><table id="drops">
       <thead><tr><th>Pos</th><th>PR</th><th>Title</th><th>Author</th><th>Tested commit</th><th>Merge</th><th>Status</th><th></th></tr></thead>
@@ -409,7 +414,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
     if (m) say("ok", m);
   }
   flashNow();
-  function decline(p, position) {
+  function decline(p, position, prefill) {
     var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
     var h = el("h2", null, "Decline PR #" + p.number + "?"); h.id = "decline-title"; dlg.appendChild(h);
     dlg.appendChild(el("p", null, p.title));
@@ -418,6 +423,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
       dlg.appendChild(el("p", "msg", "It is already picked into " + B.integrations + " at position " + position + ". Closing does not remove its merge from that branch. Afterwards run  git drop -" + position + "  (it removes positions 1-" + position + ", so re-pick the others with git pullreqs -p)."));
     }
     var ta = el("textarea"); ta.maxLength = 500; ta.placeholder = "Reason (optional)"; ta.setAttribute("aria-label", "Reason for declining"); dlg.appendChild(ta);
+    if (prefill) ta.value = prefill.slice(0, 500);
     var err = el("p", "msg"); err.setAttribute("role", "alert"); dlg.appendChild(err);
     var row = el("div", "row");
     var cancel = btn("Cancel", "", function () { dlg.close(); });
@@ -443,6 +449,92 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
         else { say("warn", res.j.message || "Reopen failed"); button.disabled = false; button.textContent = "Reopen"; }
       })
       .catch(function () { say("warn", "Could not reach the report server."); button.disabled = false; button.textContent = "Reopen"; });
+  }
+  // a POST that ends with a flash message after the reload (Pick, Drop, Ship)
+  function post(url, payload, button, busy, again, fail) {
+    var label = button.textContent; button.disabled = true; button.textContent = busy;
+    function undo(msg, j) { (fail || function (m) { say("warn", m); })(msg, j || {}); button.disabled = false; button.textContent = label; }
+    fetch(url, {method: "POST", headers: {"Content-Type": "application/json", "X-Token": LIVE.token}, body: JSON.stringify(payload)})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (res.ok) { try { sessionStorage.setItem("pullreqs-flash", res.j.message); } catch (e) {} location.reload(); }
+        else undo(res.j.message || "failed", res.j);
+      })
+      .catch(function () { undo("Could not reach the report server."); });
+  }
+  function pick(p, button) {
+    post("/api/pick", {number: p.number}, button, "Picking...", null, function (m, j) {
+      if (j.conflict) conflictDialog(p, j.conflict); else say("warn", m);
+    });
+  }
+  // the PR conflicts: say what, where it comes from, what was left untouched, and what to do next
+  function conflictDialog(p, c) {
+    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var h = el("h2", null, "PR #" + c.number + " conflicts and was not picked"); h.id = "decline-title"; dlg.appendChild(h);
+    dlg.appendChild(el("p", null, p.title));
+    dlg.appendChild(el("p", "msg", "Nothing was changed: " + B.integrations + " is exactly as it was before. These files could not be merged automatically:"));
+    var ul = el("ul"); ul.style.cssText = "margin:6px 0;padding-left:20px;font-size:14px";
+    var blockers = {};
+    c.files.forEach(function (f) {
+      var li = el("li"); li.appendChild(el("code", null, f.path));
+      li.appendChild(document.createTextNode(" - " + f.why));
+      if (f.touched_by && f.touched_by.length) {
+        li.appendChild(document.createTextNode(" (also changed by picked " + f.touched_by.map(function (n) { return "PR #" + n; }).join(", ") + ")"));
+        f.touched_by.forEach(function (n) { blockers[n] = true; });
+      }
+      ul.appendChild(li);
+    });
+    dlg.appendChild(ul);
+    var who = Object.keys(blockers).map(function (n) { return "#" + n; });
+    dlg.appendChild(el("p", null, "What you can do: " + (who.length ? "drop " + who.join(", ") + " from the picks (Drop button) and pick this one first, or " : "") +
+      "resolve it in a terminal with  " + c.command + "  , or decline the PR so the developer fixes it."));
+    var row = el("div", "row");
+    var dlg2 = dlg;
+    row.appendChild(btn("Close", "", function () { dlg2.close(); }));
+    var cp = btn("Copy command", "", function () { copy(c.command, cp, "Copied"); }); cp.title = c.command; row.appendChild(cp);
+    row.appendChild(btn("Decline PR #" + c.number, "danger", function () {
+      dlg2.close();
+      decline(p, null, "Conflicts with " + (who.length ? who.join(", ") + " in " : "the picked PRs in ") + c.files.map(function (f) { return f.path; }).join(", ") + ". Please rebase on the latest development and update the PR.");
+    }));
+    dlg.appendChild(row);
+    dlg.showModal();
+  }
+  // a confirmation dialog: opts = {title, lines, reason, label, danger, run(reasonText, goButton, showError)}
+  function confirmDialog(opts) {
+    var dlg = document.getElementById("decline-dlg"); dlg.textContent = "";
+    var h = el("h2", null, opts.title); h.id = "decline-title"; dlg.appendChild(h);
+    opts.lines.forEach(function (t) { dlg.appendChild(el("p", null, t)); });
+    var ta = null;
+    if (opts.reason) { ta = el("textarea"); ta.maxLength = 500; ta.placeholder = "Reason (optional)"; ta.setAttribute("aria-label", "Reason"); dlg.appendChild(ta); }
+    var err = el("p", "msg"); err.setAttribute("role", "alert"); dlg.appendChild(err);
+    var row = el("div", "row");
+    row.appendChild(btn("Cancel", "", function () { dlg.close(); }));
+    var go = btn(opts.label, opts.danger ? "danger solid" : "ship-go", function () {
+      opts.run(ta ? ta.value : "", go, function (m) { err.textContent = m; });
+    });
+    row.appendChild(go); dlg.appendChild(row);
+    dlg.showModal();
+  }
+  function dropPicked(r) {
+    var later = rows.filter(function (x) { return x.status === "local" && x.position > r.position; });
+    confirmDialog({
+      title: "Drop PR #" + r.number + " from the picks?", reason: true, label: "Drop PR #" + r.number, danger: true,
+      lines: [r.title || "", "It was picked into " + B.integrations + " but not pushed, so only your local branch changes. " +
+        (later.length ? "The PRs picked after it (" + later.map(function (x) { return "#" + x.number; }).join(", ") + ") are merged again on top; if one of them no longer merges, nothing is changed." : "Nothing else is affected."),
+        "The PR stays open on GitHub. To reject it as well, use Decline."],
+      run: function (reason, go, showError) {
+        post("/api/unpick", {number: r.number, reason: reason}, go, "Dropping...", null, showError);
+      }
+    });
+  }
+  function ship(local) {
+    var list = local.map(function (r) { return "#" + r.number; }).join(", ");
+    confirmDialog({
+      title: "Ship " + local.length + " PR" + (local.length === 1 ? "" : "s") + " to " + B.integrations + "?", reason: false,
+      label: "Ship " + local.length + " PR" + (local.length === 1 ? "" : "s"), danger: false,
+      lines: [list, "This pushes the local " + B.integrations + " branch to origin (a normal push, never forced), so everyone sees these PRs as integrated. Make sure they were built and tested."],
+      run: function (reason, go, showError) { post("/api/ship", {}, go, "Shipping...", null, showError); }
+    });
   }
   function positionOf(number) { var r = rows.filter(function (x) { return x.number === number && x.position !== null; })[0]; return r ? r.position : null; }
 
@@ -514,14 +606,20 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
       var st = el("td"); st.appendChild(el("span", "st " + p.status, LABEL[p.status] || p.status)); tr.appendChild(st);
       var ac = el("td", "acts");
       if (p.state === "OPEN") {
-        var lk = btn("Copy link", "", function () { copy(prUrl(p), lk, "Copied"); });
-        var cm2 = btn("Copy command", "", function () { copy("gh pr checkout " + p.number, cm2, "Copied"); });
-        lk.title = prUrl(p); cm2.title = "gh pr checkout " + p.number;
-        ac.appendChild(lk); ac.appendChild(cm2);
-        if (LIVE) {
+        if (!LIVE) {                                   // a saved snapshot cannot run Checkout: keep the copy buttons there
+          var lk = btn("Copy link", "", function () { copy(prUrl(p), lk, "Copied"); });
+          var cm2 = btn("Copy command", "", function () { copy("gh pr checkout " + p.number, cm2, "Copied"); });
+          lk.title = prUrl(p); cm2.title = "gh pr checkout " + p.number;
+          ac.appendChild(lk); ac.appendChild(cm2);
+        } else {
           var co = btn("Checkout", "primary", function () { checkout(p, co); });
           co.title = "Switch " + LIVE.path + " to " + p.head;
           ac.appendChild(co);
+          if (p.status === "ready") {
+            var pk = btn("Pick", "primary solid", function () { pick(p, pk); });
+            pk.title = "Merge PR #" + p.number + " into the local " + B.integrations + " branch (same as git pullreqs -p " + p.number + "); nothing is pushed";
+            ac.insertBefore(pk, ac.firstChild);
+          }
           if (LIVE.branch && LIVE.branch === p.head) ac.appendChild(el("span", "here", "checked out"));
           if (p.status !== "promoted") {
             var dc = btn("Decline", "danger", function () { decline(p, positionOf(p.number)); });
@@ -572,6 +670,11 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
       if (r.closed) s.appendChild(el("span", "st declined", "declined"));
       tr.appendChild(s);
       var a = el("td", "acts");
+      if (LIVE && r.status === "local") {
+        var dp = btn("Drop", "danger", function () { dropPicked(r); });
+        dp.title = "Remove PR #" + r.number + " from the picks (not pushed yet)";
+        a.appendChild(dp);
+      }
       if (LIVE && r.open && r.status !== "main") {
         var d2 = btn("Decline", "danger", function () { decline({number: r.number, title: r.title}, r.position); });
         a.appendChild(d2);
@@ -593,6 +696,16 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end}
   }
   input.addEventListener("input", drawDrops);
   drawDrops();
+  var shipBox = document.getElementById("ship");
+  var waiting = rows.filter(function (r) { return r.status === "local"; });
+  if (LIVE && waiting.length) {
+    shipBox.hidden = false;
+    shipBox.appendChild(el("span", "grow", waiting.length + " picked PR" + (waiting.length === 1 ? " is" : "s are") + " not pushed yet: " +
+      waiting.map(function (r) { return "#" + r.number; }).join(", ") + ". Test them, then ship."));
+    var sb = btn("Ship " + waiting.length + " PR" + (waiting.length === 1 ? "" : "s"), "ship-go", function () { ship(waiting); });
+    sb.title = "git push origin " + B.integrations;
+    shipBox.appendChild(sb);
+  }
   var de = document.getElementById("drops-empty");
   if (!D.integration.exists) { de.hidden = false; de.textContent = "The integrations branch does not exist yet. Pick PRs first:  git pullreqs -p <PR numbers>"; document.getElementById("drops").hidden = true; }
   else if (!rows.length) { de.hidden = false; de.textContent = "Nothing is picked into " + B.integrations + " yet."; document.getElementById("drops").hidden = true; }

@@ -138,15 +138,8 @@ def cmd_pick(tokens: List[str], args=None) -> int:
 
 
 def log_pick(rep) -> None:
-    """One audit entry per PR that was merged or that could not be."""
     from . import audit
-    for o in rep.outcomes:
-        if o.status in ("merged", "resolved"):
-            audit.record("pick", o.number, branch=rep.branch, result=o.status, auto_resolved=o.files)
-        elif o.status in ("failed", "error"):
-            audit.record("pick_failed", o.number, branch=rep.branch, result=o.status, files=o.files,
-                         why=["{}: {}".format(f, r) for f, r in o.reasons.items()], detail=o.detail,
-                         paused=o.held, fixed_by_hand=o.manual)
+    audit.log_pick(rep, "cli")
 
 
 def cmd_report(output: str):

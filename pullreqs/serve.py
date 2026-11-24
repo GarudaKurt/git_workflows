@@ -26,7 +26,7 @@ import time
 import webbrowser
 from typing import Callable, Dict, Optional, Tuple
 
-from . import audit, report
+from . import audit, basket, report
 from .staging import StagingError, git, gh_available, goto_toplevel
 
 CACHE_SECONDS = 15
@@ -86,6 +86,54 @@ class Session:
             return 200, {"ok": True, "branch": now, "previous": before, "number": number,
                          "message": "Checked out {} (PR #{}) in {}".format(now, number, self.root)}
 
+
+    def _busy(self) -> Optional[Tuple[int, dict]]:
+        from . import mergetool as mt
+        op = mt.operation()
+        if op:
+            return 409, {"ok": False, "message": "A {} is in progress in {}. Finish or abort it first.".format(op, self.root)}
+        return None
+
+    def _basket(self, fn, *args) -> Tuple[int, dict]:
+        """Run a basket operation (pick / unpick / ship) and refresh the data so the reload shows the result."""
+        busy = self._busy()
+        if busy:
+            return busy
+        result = fn(*args)
+        ok, message = result[0], result[1]
+        self.data(max_age=0)
+        payload = {"ok": ok, "message": message}
+        if len(result) > 2 and result[2]:
+            payload["conflict"] = result[2]
+        return (200 if ok else 409), payload
+
+    def pick(self, number: int) -> Tuple[int, dict]:
+        with self.lock:
+            pr = next((p for p in self.data(max_age=3600)["prs"] if p["number"] == number), None)
+            if pr is None:
+                return 404, {"ok": False, "message": "PR #{} is not in the list. Reload the page.".format(number)}
+            if pr["status"] != "ready":
+                return 409, {"ok": False, "message": "PR #{} is not ready to pick (status: {}).".format(number, pr["status"])}
+            return self._basket(basket.pick, number)
+
+    def unpick(self, number: int, reason: str) -> Tuple[int, dict]:
+        with self.lock:
+            rows = self.data(max_age=3600)["integration"]["rows"]
+            if not any(r["number"] == number and r["status"] == "local" for r in rows):
+                return 409, {"ok": False, "message": "PR #{} is not a picked, unpushed PR. Reload the page.".format(number)}
+            return self._basket(basket.unpick, number, reason)
+
+    def ship(self) -> Tuple[int, dict]:
+        with self.lock:
+            rows = self.data(max_age=0)["integration"]["rows"]
+            local = [r for r in rows if r["status"] == "local"]
+            if not local:
+                return 409, {"ok": False, "message": "Nothing to ship: no picked PR is waiting to be pushed."}
+            declined = [r["number"] for r in local if r.get("closed")]
+            if declined:
+                return 409, {"ok": False, "message": "{} was declined (closed). Drop it before shipping.".format(
+                    ", ".join("PR #%d" % n for n in declined))}
+            return self._basket(basket.ship)
 
     def decline(self, number: int, reason: str) -> Tuple[int, dict]:
         """(http status, json) for 'decline (close) PR number' on GitHub, with an optional reason as a comment."""
@@ -177,6 +225,9 @@ def _checkout_with_git(number: int, head: str) -> Tuple[bool, str]:
     return (True, "") if r.returncode == 0 else (False, "git switch {} failed: {}".format(branch, (r.stderr or r.stdout).strip()[-300:]))
 
 
+ROUTES = ("/api/checkout", "/api/decline", "/api/reopen", "/api/pick", "/api/unpick", "/api/ship")
+
+
 def make_handler(session: Session):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "pullreqs-report"
@@ -213,7 +264,7 @@ def make_handler(session: Session):
             return self._json(404, {"ok": False, "message": "not found"})
 
         def do_POST(self):
-            if self.path not in ("/api/checkout", "/api/decline", "/api/reopen"):
+            if self.path not in ROUTES:
                 return self._json(404, {"ok": False, "message": "not found"})
             if not self._host_ok():
                 return self._json(403, {"ok": False, "message": "bad Host header"})
@@ -227,8 +278,12 @@ def make_handler(session: Session):
                 if not 0 < length <= 4096:
                     raise ValueError
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(body, dict):
+                    raise ValueError
                 number = body.get("number")
-                if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                if self.path == "/api/ship":
+                    number = 0                                      # ship has no PR number
+                elif not isinstance(number, int) or isinstance(number, bool) or number <= 0:
                     raise ValueError
                 reason = body.get("reason", "")
                 if not isinstance(reason, str) or len(reason) > 500:
@@ -241,12 +296,18 @@ def make_handler(session: Session):
                     status, payload = session.decline(number, reason)
                 elif self.path == "/api/reopen":
                     status, payload = session.reopen(number)
+                elif self.path == "/api/pick":
+                    status, payload = session.pick(number)
+                elif self.path == "/api/unpick":
+                    status, payload = session.unpick(number, reason)
+                elif self.path == "/api/ship":
+                    status, payload = session.ship()
                 else:
                     status, payload = session.checkout(number)
             except subprocess.TimeoutExpired:
-                status, payload = 500, {"ok": False, "message": "checkout timed out"}
-            except StagingError as e:
-                status, payload = 500, {"ok": False, "message": str(e)}
+                status, payload = 500, {"ok": False, "message": "the operation timed out"}
+            except StagingError as e:                                # a refusal (dirty tree, diverged branch, ...)
+                status, payload = 409, {"ok": False, "message": str(e)}
             self._json(status, payload)
 
     return Handler

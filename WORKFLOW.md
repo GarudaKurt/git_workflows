@@ -67,7 +67,7 @@ The author and title come from GitHub (`gh`), else from the PR's commit. `--repo
 
 ### git pullreqs --report --serve [--port N] [--open]
 
-The same dashboard with working **Checkout** buttons. Every open PR row has *Copy link*, *Copy command* (`gh pr checkout N`) and *Checkout*, which switches the repository you started it in to that PR's branch (`gh pr checkout N`, or `git fetch origin pull/N/head` + `git switch` when gh cannot do it; an existing local branch is only switched to, never reset). It listens on 127.0.0.1 only (default port 8765, the next free one if busy; `--port 0` = any), every request needs the random token embedded in the page, only "check out open PR N" is possible, and it refuses while there are uncommitted changes or a merge/cherry-pick/rebase is in progress. Reloading the page refreshes the data. Press Ctrl+C to stop. A saved `.html` (`--report -o FILE`) is a snapshot: it has the copy buttons only.
+The same dashboard with working **Checkout** buttons. Every open PR row has a *Checkout* button (no copy buttons in the live version), which switches the repository you started it in to that PR's branch (`gh pr checkout N`, or `git fetch origin pull/N/head` + `git switch` when gh cannot do it; an existing local branch is only switched to, never reset). It listens on 127.0.0.1 only (default port 8765, the next free one if busy; `--port 0` = any), every request needs the random token embedded in the page, only "check out open PR N" is possible, and it refuses while there are uncommitted changes or a merge/cherry-pick/rebase is in progress. Reloading the page refreshes the data. Press Ctrl+C to stop. A saved `.html` (`--report -o FILE`) is a snapshot: it has the copy buttons (*Copy link*, *Copy command*) only, since it cannot run git.
 
 **Decline from the report.** In the live version (`--serve`) every open PR that is not promoted yet has a red **Decline** button, in the PR table (*Ready to pick*, in integration, ...) and in the integrations list. It opens a dialog with an optional reason; confirming runs `gh pr close N --comment "Declined via git pullreqs report. Reason: ..."`, so the PR becomes *Closed* on GitHub, exactly as when a reviewer declines it. Needs `gh` logged in (closing is a GitHub action, there is no git fallback). A PR that was already picked into integrations is then shown as **Closed, still in integrations**: closing does not remove its merge from the branch, so run `git drop -N` (N = its position) and re-pick the others. `git push-master` refuses to promote a declined PR (override: `--allow-declined`). A saved `.html` snapshot has no Decline buttons. A closed PR shows a **Reopen** button (`gh pr reopen N`), in case it was declined by mistake or the developer has fixed it; GitHub refuses when the branch was deleted or the PR was merged, and the message is shown on the page. A reopened PR is *Ready to pick* again.
 
@@ -165,14 +165,32 @@ Exit `0` = conflicts fixed and the operation continued, `1` = aborted cleanly, `
 * Undo a rewrite: `git drop` prints the previous tip: `git reset --hard <sha>`.
 * `git drop` and `-p` show PR titles when `gh` is installed and logged in.
 
+## Pick, Drop and Ship from the report
+
+The manual steps can all be done in the live report (`git pullreqs --report --serve`), next to the commands:
+
+| Button | Where | Same as | What it does |
+|---|---|---|---|
+| **Pick** | PR table, PRs that are *Ready to pick* | `git pullreqs -p N` | merges the PR into your local `integrations` branch (conflicts are resolved automatically when possible; otherwise nothing changes and a **conflict window** opens: the conflicting files, why, which already-picked PR also changed each one, what you can do (drop that PR first, resolve in a terminal, or decline the PR with the conflict filled in as the reason). **Nothing is pushed.** |
+| **Drop** | *Drops* table, PRs that are *Local only* | `git drop` (for unpushed picks) | removes that one PR from the picks. The branch is rebuilt off to the side and the PRs picked after it are merged again on top; if one of them no longer merges, nothing is changed. The PR stays open on GitHub (use **Decline** to reject it too). |
+| **Ship N PRs** | bar above the *Drops* table, shown while picks are waiting | `git push` | pushes `integrations` to origin after a confirmation. A normal push, never forced. Refused when a waiting PR was declined, or when the branch diverged from origin. |
+
+Notes:
+- Pick, Drop and Ship need a clean working tree and no merge in progress; the message tells you what to fix. Pick switches your workspace to the `integrations` branch.
+- Drop works only for PRs that are **not pushed**. A pushed PR rewrites the published branch, so it stays a terminal job: `git drop -N`.
+- Unlike `git drop -N`, Drop removes only the PR you chose, not the ones picked before it. It refuses if the branch holds commits that are not picked PRs (a rebuild would lose them).
+- Everything is written to the audit log (`pick`, `drop` with `unpushed: true`, `ship`, `ship_failed`, `via: report`).
+- A saved `.html` snapshot has no buttons.
+
 ## Audit log
 
 Every action that changes what goes to `main` is recorded in an append-only file, one JSON line per event, so "why was #24 removed, and by whom?" always has an answer:
 
 | action | written by | useful fields |
 |---|---|---|
-| `pick` / `pick_failed` | `git pullreqs -p` | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
-| `drop` / `drop_failed` | `git drop -N` | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
+| `pick` / `pick_failed` | `git pullreqs -p`, report **Pick** | result, auto-resolved files, conflicting files and why, paused, fixed by hand |
+| `drop` / `drop_failed` | `git drop -N`, report **Drop** | position, **reason**, PRs dropped together, PRs kept, old/new tip, report file, saved copy |
+| `ship` / `ship_failed` | report **Ship** | merge, tip, PRs shipped together, why it was rejected |
 | `promote` / `promote_failed` | `git push-master` | promotion PR number, message, PRs promoted together, why it failed |
 | `decline`, `reopen`, `checkout` | the live report | reason, title, author, position in integrations |
 
